@@ -22,6 +22,7 @@ from __future__ import annotations
 import io
 import os
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -63,13 +64,48 @@ def _init_session_state() -> None:
         "last_error": None,         # Son hata mesajı
         "last_job_name": None,      # Son batch job ismi (debug için)
         "failed_keys": [],          # Başarısız istekler
+        "run_started_at": None,     # Üretim başlangıç zamanı (timestamp)
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
 
 
+# ---------------------------------------------------------------------------
+# OTOMATİK KILITLENME ÇÖZÜCÜ
+# Streamlit bir widget'a tıklanınca scripti baştan çalıştırır.
+# Eğer o sırada is_running=True iken script yarım kaldıysa (finally çalışmadı),
+# buton kalıcı disabled kalır. Çözüm: belirli süre geçtiyse otomatik sıfırla.
+# ---------------------------------------------------------------------------
+_RUN_TIMEOUT_SECONDS = 600  # 10 dakika - Batch'in bile bu kadar uzun sürmesi şüpheli
+
+def _auto_reset_if_stuck() -> None:
+    """
+    is_running=True takılı kaldıysa otomatik sıfırlar.
+
+    Streamlit'in rerun döngüsünde her script çalıştığında bu fonksiyon
+    kontrol yapar. run_started_at'tan bu yana 10 dakika geçtiyse ve
+    hâlâ is_running=True ise → kimse gözetmeden bir şeyler kilitlenmiş →
+    sıfırla, kullanıcı yeniden başlatabilsin.
+    """
+    if not st.session_state.is_running:
+        return  # Sorun yok, çalışmıyor zaten
+
+    started = st.session_state.get("run_started_at")
+    if started is None:
+        # Timestamp yok ama is_running=True → eski state kalıntısı → sıfırla
+        st.session_state.is_running = False
+        return
+
+    elapsed = time.time() - started
+    if elapsed > _RUN_TIMEOUT_SECONDS:
+        # 10 dakika geçmiş, hâlâ "çalışıyor" → kilitlenmiş
+        st.session_state.is_running = False
+        st.session_state.run_started_at = None
+
+
 _init_session_state()
+_auto_reset_if_stuck()  # Her script run'ında kilitlenme kontrolü yap
 
 
 # ===========================================================================
@@ -144,7 +180,25 @@ with st.sidebar:
 
     st.divider()
 
-    # Önceki üretimi temizleme butonu - kullanıcı yeniden başlamak isterse
+    # --- "Başlat" butonu takılı kaldıysa manuel sıfırlama ---
+    # is_running=True iken script yarım kalırsa buton kalıcı disabled olur.
+    # Otomatik sıfırlama 10 dk bekler; bu buton ANINDA kurtarır.
+    if st.session_state.is_running:
+        st.warning("⏳ Üretim çalışıyor veya askıda kaldı.")
+        if st.button(
+            "🔓 Butonu Kilidden Çıkar",
+            help=(
+                "Üretim butonunu takılı kaldıysa serbest bırakır. "
+                "Çalışan bir işlem varsa o iptal OLMAZ, sadece buton aktifleşir."
+            ),
+            width="stretch",
+            type="secondary",
+        ):
+            st.session_state.is_running = False
+            st.session_state.run_started_at = None
+            st.rerun()
+
+    # Önceki üretimi temizleme butonu
     if st.session_state.saved_paths:
         if st.button(
             "🗑️ Önceki üretimi temizle",
@@ -308,6 +362,12 @@ def _render_live_grid(
         st.markdown(f"### 🖼️ Üretilen Görseller ({len(paths)})")
 
         zip_bytes = _make_zip_bytes(paths)
+        # KEY NEDEN DİNAMİK?
+        # _render_live_grid streaming sırasında defalarca çağrılır.
+        # Streamlit key'leri session bazlı takip eder. Aynı key iki kez
+        # görünürse "duplicate key" hatası fırlar. Görsel sayısını key'e
+        # ekleyince her çağrıda FARKLI bir key üretiliyor → çakışma yok.
+        zip_key = f"zip_dl_{len(paths)}"
         st.download_button(
             label=f"📦 Hepsini ZIP olarak indir ({len(paths)} görsel)",
             data=zip_bytes,
@@ -315,8 +375,7 @@ def _render_live_grid(
             mime="application/zip",
             width="stretch",
             type="secondary",
-            # key sabit - aynı buton her güncellemede - state preserved
-            key="zip_download_all",
+            key=zip_key,
         )
 
         st.markdown("")  # küçük boşluk
@@ -339,21 +398,22 @@ def _render_live_grid(
                         )
 
                         # ----- BİREYSEL İNDİR BUTONU -----
-                        # Path'i bytes olarak oku - download_button bunu kullanır
                         with open(path, "rb") as f:
                             image_bytes = f.read()
 
-                        # MIME türünü uzantıdan tahmin et
                         suffix = path.suffix.lstrip(".").lower()
                         mime = f"image/{'jpeg' if suffix == 'jpg' else suffix}"
 
+                        # len(paths) + row_start + path.stem kombinasyonu:
+                        # Her _render_live_grid çağrısında paths sayısı farklı
+                        # olduğu için key her seferinde unique oluyor.
+                        dl_key = f"dl_{len(paths)}_{row_start}_{path.stem}"
                         st.download_button(
                             label="💾 İndir",
                             data=image_bytes,
                             file_name=path.name,
                             mime=mime,
-                            # Her butona unique key gerekli - path adı yeterince unique
-                            key=f"dl_{path.name}",
+                            key=dl_key,
                             width="stretch",
                         )
                     except Exception as e:
@@ -552,6 +612,7 @@ if start_button:
     else:
         # State sıfırla
         st.session_state.is_running = True
+        st.session_state.run_started_at = time.time()  # Kilitlenme tespiti için
         st.session_state.last_error = None
         st.session_state.saved_paths = []
         st.session_state.failed_keys = []
