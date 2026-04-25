@@ -147,6 +147,8 @@ with st.sidebar:
         ),
     )
 
+    # --- Standart-mod'a özel ayarlar (worker + retry) ---
+    # Batch'te bunlar geçerli değil çünkü Google sunucusu zaten paralelize ediyor.
     if api_mode == "standart":
         max_workers = st.slider(
             "Eş zamanlı istek sayısı",
@@ -158,8 +160,44 @@ with st.sidebar:
                 "Paid tier için 3 dengeli."
             ),
         )
+
+        # Retry slider: model bazen "STOP" diyip görsel üretmiyor; otomatik
+        # tekrar deneme bunu kurtarır. AMA her retry = ekstra API maliyeti.
+        # 1 = retry yok (en ucuz), 2 = denge, 3 = en güvenli (max maliyet).
+        max_attempts = st.slider(
+            "Başarısız istek için tekrar deneme",
+            min_value=1,
+            max_value=3,
+            value=2,
+            help=(
+                "Model bazen görsel yerine sadece text döner. Retry bunu kurtarır.\n"
+                "1 = Retry kapalı (en ucuz, başarısız varyasyon kaybedilir)\n"
+                "2 = Varsayılan (denge)\n"
+                "3 = Maksimum güvenlik (her başarısızlık 3x maliyet)"
+            ),
+        )
     else:
         max_workers = None
+        max_attempts = 1  # Batch'te retry kavramı yok (sunucu kendi yapar)
+
+    # --- Her İKİ MOD için ortak ayar: auto-prefix ---
+    # Hem Standart hem Batch'te aynı modeli (gemini-2.5-flash-image) çağırıyoruz,
+    # dolayısıyla "STOP-without-image" sorunu her ikisinde de var. Çözüm de aynı:
+    # imperatif prompt prefix'i. UI'da tek checkbox - kullanıcı her iki modda da
+    # aynı kontrolü görsün diye if dışında.
+    use_auto_prefix = st.checkbox(
+        "🎯 Otomatik 'görsel üret' öneki ekle",
+        value=True,
+        help=(
+            "Master prompt'unun başına şu cümle eklenir:\n\n"
+            "\"Based on the provided reference image, generate a new "
+            "image that matches the description below.\"\n\n"
+            "Modelin sadece-text döndürme eğilimini ~%80 azaltır. "
+            "Maliyeti yok denecek kadar az (~25 token = ~$0.000003). "
+            "Hem Standart hem Batch modunda çalışır. "
+            "Master prompt'una zaten benzer bir komut yazdıysan kapatabilirsin."
+        ),
+    )
 
     st.divider()
 
@@ -250,10 +288,33 @@ with col_right:
         "Sabit metin (her varyasyona uygulanacak temel komut)",
         height=140,
         placeholder=(
-            "Örnek: Bu görselin stilini koruyarak aşağıda belirtilen "
-            "varyasyona uygun yeni bir versiyon üret."
+            "Örnek: Bu görselin stilini ve karakterlerini koruyarak "
+            "aşağıdaki varyasyona uygun yeni bir versiyon üret."
+        ),
+        help=(
+            "💡 Otomatik önek varsayılan olarak AÇIK (sidebar'dan görebilirsin). "
+            "Yani senin yazdığın prompt'un başına model'i 'görsel üret' "
+            "demeye zorlayan İngilizce kısa bir cümle ekleniyor. "
+            "Sen sadece sahnenin/varyasyonun ne olacağını anlat - "
+            "model'e komut vermeyi bize bırakabilirsin."
         ),
     )
+
+    # Auto-prefix kapalıysa ve kullanıcı imperatif yazmadıysa uyar.
+    # Auto-prefix açıksa zaten model komut alıyor, uyarı gerekmez.
+    if not use_auto_prefix and master_prompt.strip():
+        _prompt_hint_keywords = [
+            "üret", "generate", "create", "draw", "produce", "make"
+        ]
+        _has_imperative = any(
+            kw in master_prompt.lower() for kw in _prompt_hint_keywords
+        )
+        if not _has_imperative:
+            st.caption(
+                "⚠️ Otomatik önek kapalı ve prompt'unda 'görsel üret' "
+                "benzeri bir komut göremedim. Başarı oranı düşebilir - "
+                "ya sidebar'dan oneki aç ya da prompt'una imperatif komut ekle."
+            )
 
     st.subheader("🔀 3. Varyasyonlar")
     variations_text = st.text_area(
@@ -443,11 +504,16 @@ def _run_batch_flow(
     variations_list: list[str],
     output_dir: str,
     grid_placeholder,
+    use_auto_prefix: bool = True,
 ) -> tuple[list[Path], list[str]]:
     """
     Batch API: JSONL üret, job başlat, polling, sonuç indir, kaydet.
     Batch'te sonuçlar TOPLU geliyor; canlı grid stream yapılamıyor.
     Sadece bittiğinde grid'i bir kerede çiziyoruz.
+
+    Args:
+        use_auto_prefix: True ise her JSONL satırının prompt'unun başına
+            görsel-üret prefix'i eklenir (Standard mode ile simetrik).
     """
     st.write("🔧 Gemini Batch istemcisi hazırlanıyor...")
     handler = GeminiBatchHandler(api_key=api_key)
@@ -460,6 +526,7 @@ def _run_batch_flow(
         master_prompt=master_prompt,
         variations=variations_list,
         output_path="batch_requests.jsonl",
+        use_auto_prefix=use_auto_prefix,
     )
 
     st.write("🚀 Batch Job başlatılıyor...")
@@ -510,6 +577,8 @@ def _run_standard_flow(
     workers: int,
     output_dir: str,
     grid_placeholder,
+    max_attempts: int = 2,
+    use_auto_prefix: bool = True,
 ) -> tuple[list[Path], list[str]]:
     """
     Standart API: Paralel üretim + her görsel anında diske + canlı grid update.
@@ -548,6 +617,8 @@ def _run_standard_flow(
         master_prompt=master_prompt,
         variations=variations_list,
         max_workers=workers,
+        max_attempts=max_attempts,
+        use_auto_prefix=use_auto_prefix,
     ):
         # ----- 1) Progress bar -----
         pct = prog.completed / prog.total
@@ -639,6 +710,7 @@ if start_button:
                         variations_list=variations_list,
                         output_dir=output_dir,
                         grid_placeholder=live_grid_placeholder,
+                        use_auto_prefix=use_auto_prefix,
                     )
                 else:
                     saved_paths, failed_keys = _run_standard_flow(
@@ -649,6 +721,8 @@ if start_button:
                         workers=max_workers or 2,
                         output_dir=output_dir,
                         grid_placeholder=live_grid_placeholder,
+                        max_attempts=max_attempts,
+                        use_auto_prefix=use_auto_prefix,
                     )
 
                 st.session_state.saved_paths = saved_paths

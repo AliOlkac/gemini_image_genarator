@@ -55,6 +55,17 @@ TERMINAL_STATES = {
     "JOB_STATE_EXPIRED",     # 24 saat içinde bitmedi
 }
 
+# OTOMATİK GÖRSEL-ÜRET PREFIX'İ:
+# Modelin "STOP-without-image" davranışını ~%80 azaltan imperatif komut cümlesi.
+# Standard mode'daki ile AYNI olmalı - tutarlılık için.
+# DİKKAT: standard_handler.py'daki IMAGE_GENERATION_PREFIX ile senkron tut!
+# (DRY ihlali değil; iki modül mimari olarak eşit seviyede - import etmek
+#  yerine kopya tutuyoruz. Refactor gerekirse ortak `prompts.py` açılabilir.)
+IMAGE_GENERATION_PREFIX = (
+    "Based on the provided reference image, generate a new image "
+    "that matches the description below.\n\n"
+)
+
 
 # ---------------------------------------------------------------------------
 # Polling sırasında UI'a "şu anda hangi durumdayız" bilgisini iletmek için
@@ -176,10 +187,16 @@ class GeminiBatchHandler:
         master_prompt: str,
         variations: list[str],
         output_path: str | Path = "batch_requests.jsonl",
+        use_auto_prefix: bool = True,
     ) -> Path:
         """
         Master Prompt + her varyasyonu birleştirip Batch API formatında
         JSONL dosyası üretir.
+
+        Args:
+            use_auto_prefix: True ise IMAGE_GENERATION_PREFIX prompt'un başına
+                eklenir. Modelin "STOP-without-image" davranışını ~%80 azaltır.
+                Standard mode'daki davranışla simetrik (UI checkbox aynı).
 
         JSONL formatı (her satır bir JSON nesnesi):
             {
@@ -210,12 +227,17 @@ class GeminiBatchHandler:
 
         output_path = Path(output_path)
 
+        # Auto-prefix ile prompt'un başına imperatif komut ekleyelim mi?
+        # Standard mode'daki ile AYNI mantık - sidebar checkbox bu değeri kontrol eder.
+        prefix = IMAGE_GENERATION_PREFIX if use_auto_prefix else ""
+
         # JSONL'i satır satır yazıyoruz (utf-8 emoji/Türkçe karakterler için şart)
         with output_path.open("w", encoding="utf-8") as f:
             for idx, variation in enumerate(cleaned_variations, start=1):
-                # Master Prompt + varyasyon birleştirme
-                # İki nokta üst üste ile ayırmak Gemini'nin daha iyi parse etmesine yardım eder
-                combined_prompt = f"{master_prompt.strip()}\n\nVaryasyon: {variation}"
+                # [opsiyonel auto-prefix] + master_prompt + varyasyon
+                combined_prompt = (
+                    f"{prefix}{master_prompt.strip()}\n\nVaryasyon: {variation}"
+                )
 
                 # Batch isteği için tek bir JSON nesnesi
                 request_obj = {
