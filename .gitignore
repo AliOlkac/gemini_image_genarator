@@ -1,6 +1,7 @@
 # Hassas bilgiler - asla commit edilmemeli (API anahtarları içeriyor)
 .env
 .env.local
+.env.example
 
 # Üretilen görseller - kullanıcıya özgü çıktılar
 outputs/
