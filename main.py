@@ -147,8 +147,11 @@ with st.sidebar:
         ),
     )
 
-    # --- Standart-mod'a özel ayarlar (worker + retry) ---
-    # Batch'te bunlar geçerli değil çünkü Google sunucusu zaten paralelize ediyor.
+    # --- Standart-mod'a özel ayar: paralel worker sayısı ---
+    # Batch'te geçerli değil çünkü Google sunucusu zaten paralelize ediyor.
+    # NOT: Retry mekanizması bilinçli olarak KALDIRILDI - bug durumunda istek
+    # sayısının patlamaması için. Auto-prefix tek savunma hattı; başarısız
+    # varyasyonu kullanıcı manuel olarak tekrar denemekle yükümlü.
     if api_mode == "standart":
         max_workers = st.slider(
             "Eş zamanlı istek sayısı",
@@ -160,25 +163,8 @@ with st.sidebar:
                 "Paid tier için 3 dengeli."
             ),
         )
-
-        # Retry slider: model bazen "STOP" diyip görsel üretmiyor; otomatik
-        # tekrar deneme bunu kurtarır. AMA her retry = ekstra API maliyeti.
-        # 1 = retry yok (en ucuz), 2 = denge, 3 = en güvenli (max maliyet).
-        max_attempts = st.slider(
-            "Başarısız istek için tekrar deneme",
-            min_value=1,
-            max_value=3,
-            value=2,
-            help=(
-                "Model bazen görsel yerine sadece text döner. Retry bunu kurtarır.\n"
-                "1 = Retry kapalı (en ucuz, başarısız varyasyon kaybedilir)\n"
-                "2 = Varsayılan (denge)\n"
-                "3 = Maksimum güvenlik (her başarısızlık 3x maliyet)"
-            ),
-        )
     else:
         max_workers = None
-        max_attempts = 1  # Batch'te retry kavramı yok (sunucu kendi yapar)
 
     # --- Her İKİ MOD için ortak ayar: auto-prefix ---
     # Hem Standart hem Batch'te aynı modeli (gemini-2.5-flash-image) çağırıyoruz,
@@ -577,7 +563,6 @@ def _run_standard_flow(
     workers: int,
     output_dir: str,
     grid_placeholder,
-    max_attempts: int = 2,
     use_auto_prefix: bool = True,
 ) -> tuple[list[Path], list[str]]:
     """
@@ -617,7 +602,6 @@ def _run_standard_flow(
         master_prompt=master_prompt,
         variations=variations_list,
         max_workers=workers,
-        max_attempts=max_attempts,
         use_auto_prefix=use_auto_prefix,
     ):
         # ----- 1) Progress bar -----
@@ -721,7 +705,6 @@ if start_button:
                         workers=max_workers or 2,
                         output_dir=output_dir,
                         grid_placeholder=live_grid_placeholder,
-                        max_attempts=max_attempts,
                         use_auto_prefix=use_auto_prefix,
                     )
 
