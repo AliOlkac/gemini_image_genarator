@@ -1,0 +1,29 @@
+# Hassas bilgiler - asla commit edilmemeli (API anahtarları içeriyor)
+.env
+.env.local
+
+# Üretilen görseller - kullanıcıya özgü çıktılar
+outputs/
+
+# Geçici batch JSONL dosyaları (her çalıştırmada yeniden üretiliyor)
+*.jsonl
+
+# Python derleme önbellek klasörleri
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Sanal ortam klasörleri (her geliştirici kendi yereline kuracak)
+.venv/
+venv/
+env/
+
+# IDE / editör dosyaları
+.vscode/
+.idea/
+*.swp
+
+# OS bazlı çöp dosyalar
+Thumbs.db
+.DS_Store

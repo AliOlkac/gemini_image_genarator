@@ -1,0 +1,23 @@
+# ============================================================
+# Gemini 2.5 Flash Image Batcher - Python Bağımlılıkları
+# ============================================================
+# Kurulum:  pip install -r requirements.txt
+
+# Streamlit: Hızlı web arayüzü kurmak için kullandığımız framework.
+# Sadece Python ile reaktif UI yazmamızı sağlıyor.
+streamlit>=1.30.0
+
+# google-genai: Google'ın YENİ resmi Gen AI SDK'sı (deprecated google-generativeai
+# yerine geçer). Batch API ve gemini-2.5-flash-image desteği bu kütüphanede.
+google-genai>=0.3.0
+
+# python-dotenv: .env dosyasından API_KEY gibi ortam değişkenlerini okumak için.
+python-dotenv>=1.0.0
+
+# aiofiles: Asenkron dosya I/O kütüphanesi. asyncio ile birlikte kullanarak
+# birçok görseli paralel olarak diske yazmamızı sağlar.
+aiofiles>=23.0.0
+
+# Pillow (PIL): Görsel önizleme, format dönüşümü ve doğrulama için.
+# Streamlit st.image() bunu zaten arka planda kullanıyor.
+Pillow>=10.0.0
