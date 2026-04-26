@@ -22,6 +22,7 @@ NEDEN MODÜLER?
 from __future__ import annotations
 
 import base64
+import io
 import json
 import mimetypes
 import time
@@ -143,9 +144,17 @@ class GeminiBatchHandler:
         if not mime_type:
             mime_type = "image/png"  # Bilinmeyen tip için güvenli varsayılan
 
+        # Belleğe oku + BytesIO: OneDrive / geçici dosya yolunda resumable
+        # upload'un "Upload has already been terminated" (400) vermesini önler.
+        # Ayrıntı: standard_handler.upload_master_image ile aynı gerekçe.
+        file_bytes = path.read_bytes()
+        if not file_bytes:
+            raise ValueError(f"Master görsel boş veya okunamadı: {path}")
+        buffer = io.BytesIO(file_bytes)
+
         # Files API'ye yükle. config parametresi MIME'ı manuel set eder.
         uploaded = self.client.files.upload(
-            file=str(path),
+            file=buffer,
             config=types.UploadFileConfig(
                 display_name=path.name,
                 mime_type=mime_type,
@@ -285,9 +294,15 @@ class GeminiBatchHandler:
         """
         jsonl_path = Path(jsonl_path)
 
+        # JSONL'i de bellekten yükle (master ile aynı resumable-upload stabilitesi).
+        jsonl_bytes = jsonl_path.read_bytes()
+        if not jsonl_bytes:
+            raise ValueError(f"JSONL boş: {jsonl_path}")
+        jsonl_buffer = io.BytesIO(jsonl_bytes)
+
         # Files API'ye JSONL upload (mime_type "jsonl" olmalı)
         uploaded = self.client.files.upload(
-            file=str(jsonl_path),
+            file=jsonl_buffer,
             config=types.UploadFileConfig(
                 display_name=jsonl_path.name,
                 mime_type="application/jsonl",

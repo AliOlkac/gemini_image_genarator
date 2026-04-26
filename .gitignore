@@ -1,7 +1,7 @@
 # Hassas bilgiler - asla commit edilmemeli (API anahtarları içeriyor)
 .env
 .env.local
-# NOT: .env.example ŞABLON dosyasıdır — sadece placeholder içerir, Git'e eklenmeli.
+.env.example
 
 # Üretilen görseller - kullanıcıya özgü çıktılar
 outputs/

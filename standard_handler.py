@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import base64
 import mimetypes
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -48,10 +47,10 @@ MODEL_NAME = "gemini-2.5-flash-image"
 # Kullanıcı UI'dan değiştirebilir (1-5 aralığında).
 DEFAULT_MAX_WORKERS = 2
 
-# Files API: yüklenen dosya ACTIVE state'e gelene kadar maksimum bekleme.
-# Genelde 1-3 saniye yeterli, 30 saniye güvenli üst sınır.
-FILE_ACTIVE_TIMEOUT_SECONDS = 30
-FILE_POLL_INTERVAL_SECONDS = 0.5  # Hızlı polling - dosyalar genelde çabuk hazır
+# Master görseli inline (bytes) gönderirken üst boyut sınırı.
+# Gemini istek gövdesi sınırları için; aşarsak kullanıcıyı net uyarırız.
+# (Çok büyük görsellerde yine de sıkıştırma / küçültme önerilir.)
+MAX_MASTER_IMAGE_BYTES = 20 * 1024 * 1024  # ~20 MiB
 
 # OTOMATİK GÖRSEL-ÜRET PREFIX'İ:
 # Test edilmiş en güçlü formül - 3 katmanlı sinyal:
@@ -90,8 +89,12 @@ class GeminiStandardHandler:
     """
     Standart (non-batch) Gemini görsel üretim akışını yöneten sınıf.
 
-    Master görseli bir kez yükler (Files API), sonra her varyasyonu
-    paralel olarak generate_content ile üretir.
+    Master görseli Files API ile YÜKLEMEZ: `client.files.upload` bazı
+    ortamlarda (Windows, proxy, SDK resumable upload) 400
+    "Upload has already been terminated" verebiliyor. Bunun yerine görsel
+    baytlarını bellekte tutar; her `generate_content` çağrısında inline
+    (`Part.from_bytes`) olarak gönderir. Ekstra input token maliyeti olur
+    ama güvenilirlik artar.
     """
 
     def __init__(self, api_key: str) -> None:
@@ -108,8 +111,8 @@ class GeminiStandardHandler:
 
         self.client = genai.Client(api_key=api_key)
 
-        # State değişkenleri
-        self.master_file_obj = None        # Files API'den dönen File nesnesi
+        # Master görsel: Files API yok; bellekte ham baytlar + MIME.
+        self._master_image_bytes: bytes | None = None
         self.master_mime_type: str | None = None
 
         # Üretim sonuçlarını tutmak için (generator yield'ları sırasında doluyor)
@@ -117,22 +120,19 @@ class GeminiStandardHandler:
         self.failed_keys: list[str] = []
 
     # -----------------------------------------------------------------------
-    # Master görseli Files API'ye yükle + ACTIVE durumuna gelene kadar bekle
+    # Master görseli belleğe al (Files API YOK — inline gönderim)
     # -----------------------------------------------------------------------
     def upload_master_image(self, image_path: str | Path) -> None:
         """
-        Master görseli Files API'ye yükler ve dosya ACTIVE state'e gelene
-        kadar bekler.
+        Master görseli diskten okuyup bellekte saklar.
 
-        NEDEN ACTIVE BEKLEMESİ GEREKLİ?
-        --------------------------------
-        client.files.upload() dosyayı yükler ama Google sunucusunda dosya
-        önce PROCESSING state'inde başlar. Birkaç saniye sonra ACTIVE'e
-        geçer. Eğer ACTIVE olmadan generate_content çağırırsak:
-            - Hata fırlatmaz (sessiz başarısızlık)
-            - Model görseli "okuyamaz", text-only response döner
-            - Kullanıcı [BOS] görür ama nedenini bilmez
-        Bu fonksiyon o yarış durumunu (race condition) önler.
+        İsim `upload_master_image` kaldı (main.py ve alışkanlık uyumu).
+        Gerçekte Files API'ye yükleme YAPILMAZ: `files.upload` resumable
+        protokolünde 400 "Upload has already been terminated" hatası
+        bazı kullanıcı ortamlarında sürekli tetiklenebiliyor.
+
+        ÇÖZÜM: Baytlar `generate_content` içinde `Part.from_bytes` ile
+        her istekte inline gider. ACTIVE bekleme gerekmez; yarış durumu yok.
         """
         path = Path(image_path)
         if not path.exists():
@@ -143,41 +143,17 @@ class GeminiStandardHandler:
         if not mime_type:
             mime_type = "image/png"
 
-        # 1) Yükle (initial state genelde "PROCESSING")
-        uploaded = self.client.files.upload(
-            file=str(path),
-            config=types.UploadFileConfig(
-                display_name=path.name,
-                mime_type=mime_type,
-            ),
-        )
+        file_bytes = path.read_bytes()
+        if not file_bytes:
+            raise ValueError(f"Master görsel boş veya okunamadı: {path}")
+        if len(file_bytes) > MAX_MASTER_IMAGE_BYTES:
+            raise ValueError(
+                f"Master görsel çok büyük ({len(file_bytes) // 1024 // 1024} MiB). "
+                f"Maksimum ~{MAX_MASTER_IMAGE_BYTES // 1024 // 1024} MiB; "
+                "görseli küçült veya sıkıştır."
+            )
 
-        # 2) ACTIVE state polling - dosya hazır olana kadar bekle
-        deadline = time.time() + FILE_ACTIVE_TIMEOUT_SECONDS
-        while True:
-            # state.name değerleri: "PROCESSING", "ACTIVE", "FAILED"
-            current_state = uploaded.state.name if uploaded.state else "UNKNOWN"
-
-            if current_state == "ACTIVE":
-                break  # Hazır - çık
-
-            if current_state == "FAILED":
-                raise RuntimeError(
-                    f"Master görsel Files API'de işlenemedi (FAILED): {path.name}"
-                )
-
-            if time.time() > deadline:
-                raise TimeoutError(
-                    f"Master görsel {FILE_ACTIVE_TIMEOUT_SECONDS} saniyede "
-                    f"ACTIVE olmadı. Son durum: {current_state}"
-                )
-
-            # Kısa bekleme + tekrar sorgula
-            time.sleep(FILE_POLL_INTERVAL_SECONDS)
-            uploaded = self.client.files.get(name=uploaded.name)
-
-        # File nesnesini saklıyoruz - generate_content'e direkt geçilebilir
-        self.master_file_obj = uploaded
+        self._master_image_bytes = file_bytes
         self.master_mime_type = mime_type
 
     # -----------------------------------------------------------------------
@@ -215,13 +191,33 @@ class GeminiStandardHandler:
         """
         key = f"req-{idx:03d}"
 
+        # ThreadPool içinden de çağrılabilir; master yükü kontrolü (tip güvenliği).
+        master_bytes = self._master_image_bytes
+        if master_bytes is None:
+            raise RuntimeError(
+                "Master görsel yüklenmemiş. Önce upload_master_image() çağrılmalı."
+            )
+
         # PROMPT BİRLEŞTİRME: [opsiyonel auto prefix] + master_prompt + varyasyon.
         prefix = IMAGE_GENERATION_PREFIX if use_auto_prefix else ""
         combined = f"{prefix}{master_prompt.strip()}\n\nVaryasyon: {variation}"
 
+        # Tek kullanıcı mesajı: önce referans görsel (inline), sonra metin.
+        # Files API kullanmıyoruz — resumable upload hatalarından kaçınmak için.
+        user_content = types.Content(
+            role="user",
+            parts=[
+                types.Part.from_bytes(
+                    data=master_bytes,
+                    mime_type=self.master_mime_type or "image/png",
+                ),
+                types.Part.from_text(text=combined),
+            ],
+        )
+
         response = self.client.models.generate_content(
             model=MODEL_NAME,
-            contents=[self.master_file_obj, combined],
+            contents=[user_content],
             config=types.GenerateContentConfig(
                 response_modalities=["TEXT", "IMAGE"],
             ),
@@ -331,7 +327,7 @@ class GeminiStandardHandler:
         Yields:
             Her tamamlanan istek için bir StandardProgress.
         """
-        if not self.master_file_obj:
+        if self._master_image_bytes is None:
             raise RuntimeError("Önce upload_master_image() çağırmalısın.")
 
         cleaned = [v.strip() for v in variations if v.strip()]
@@ -394,10 +390,6 @@ class GeminiStandardHandler:
     # Temizlik (best-effort, batch_handler ile simetrik)
     # -----------------------------------------------------------------------
     def cleanup(self) -> None:
-        """Files API'ye yüklenen master görseli silmeye çalışır."""
-        if self.master_file_obj is not None:
-            try:
-                self.client.files.delete(name=self.master_file_obj.name)
-            except Exception:
-                # Silinemese de ana akış zaten bitti - sessiz yut
-                pass
+        """Bellekteki master görsel baytlarını serbest bırakır (Files API yok)."""
+        self._master_image_bytes = None
+        self.master_mime_type = None
