@@ -49,8 +49,31 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+
+def _is_streamlit_community_cloud() -> bool:
+    """
+    Streamlit Community Cloud konteynerinde repo /mount/src altına klonlanır.
+
+    Bu path varsa çok kullanıcılı bulut dağıtımındayız demektir: varsayılan API
+    anahtarını ortamdan ASLA doldurmayız; aksi halde Secrets/.env yanlışlıkla
+    tüm ziyaretçilere aynı anahtarı verir ve fatura deploy eden kişiye yazılır.
+    """
+    try:
+        return Path("/mount/src").is_dir()
+    except OSError:
+        return False
+
+
+# Yerel geliştirme: .env → GEMINI_API_KEY. Cloud'ta .env yoktur.
 load_dotenv()
-DEFAULT_API_KEY = os.getenv("GEMINI_API_KEY", "")
+
+if _is_streamlit_community_cloud():
+    # Güvenlik: bulutta ortam değişkenindeki anahtarı varsayılan gösterme.
+    DEFAULT_API_KEY = ""
+    IS_STREAMLIT_CLOUD = True
+else:
+    DEFAULT_API_KEY = os.getenv("GEMINI_API_KEY", "")
+    IS_STREAMLIT_CLOUD = False
 
 
 # ---------------------------------------------------------------------------
@@ -114,14 +137,28 @@ _auto_reset_if_stuck()  # Her script run'ında kilitlenme kontrolü yap
 with st.sidebar:
     st.title("⚙️ Ayarlar")
 
+    # Bulut dağıtımında kullanıcıya tek cümlede güvenlik modelini anlatıyoruz.
+    if IS_STREAMLIT_CLOUD:
+        st.info(
+            "☁️ **Bulut:** Kendi Gemini API anahtarını aşağıya yapıştır. "
+            "Ücretsiz anahtar: [aistudio.google.com/apikey](https://aistudio.google.com/apikey). "
+            "Fatura anahtarı oluşturan Google hesabına yazılır; uygulama sahibine değil."
+        )
+
+    _api_key_help = (
+        "Anahtarı https://aistudio.google.com/apikey adresinden al. "
+        + (
+            "Bu ortamda .env yok; anahtarı her oturumda buraya yapıştırmalısın."
+            if IS_STREAMLIT_CLOUD
+            else "Yerelde .env içindeki GEMINI_API_KEY bu alana otomatik doldurulur."
+        )
+    )
+
     api_key_input = st.text_input(
         "Gemini API Key",
         value=DEFAULT_API_KEY,
         type="password",
-        help=(
-            "Anahtarını https://aistudio.google.com/apikey adresinden al. "
-            ".env dosyasından otomatik yükleniyor."
-        ),
+        help=_api_key_help,
     )
 
     output_dir = st.text_input(
@@ -187,20 +224,34 @@ with st.sidebar:
 
     st.divider()
 
+    # FİYAT NOTU: Tüm rakamlar Nisan 2026 itibariyle resmi Google fiyat sayfasından.
+    # Her görsel = 1290 output token × $30/1M = tam $0.039 (Standard).
+    # Batch %50 indirimle $0.0195/görsel.
     if api_mode == "standart":
         st.success(
             "💡 **Standart API**\n\n"
             "- Anında sonuç (saniyeler)\n"
             "- Canlı grid: üretildikçe görüntüle\n"
-            "- Her görsel ~0.0004$"
+            "- **~$0.039/görsel** (tam fiyat)"
         )
     else:
         st.warning(
             "⚠️ **Batch API**\n\n"
-            "- %50 daha ucuz (~0.0002$/görsel)\n"
+            "- **~$0.0195/görsel** (%50 indirim)\n"
             "- Dakikalar - 24 saat arası sürebilir\n"
             "- Sonuç toplu görüntülenir"
         )
+
+    # --- CANLI MALİYET TAHMİNİ ---
+    # Kullanıcı varyasyon yazdıkça anında "ne kadar para harcayacağım?" görsün.
+    # st.session_state üzerinden değil, doğrudan widget değerinden okuyamayız
+    # çünkü main akıştaki text_area henüz çalışmadı; bunu form altında
+    # ayrıca render edeceğiz (variations_text doluyken).
+    st.divider()
+    st.caption(
+        "💰 **Maliyet ipucu**: Varyasyon listeni yazdıktan sonra "
+        "form altında canlı tahmin göreceksin."
+    )
 
     st.divider()
 
@@ -313,6 +364,47 @@ with col_right:
             "Ormanlık alan, yağmurlu hava"
         ),
     )
+
+    # --- CANLI MALİYET TAHMİNİ ---
+    # Kullanıcı varyasyon yazdıkça anında "ne kadar para harcayacağım?" görsün.
+    # Boş satırları sayma (kullanıcı genelde bırakır).
+    _variation_count = sum(
+        1 for line in variations_text.splitlines() if line.strip()
+    )
+    if _variation_count > 0:
+        # Resmi fiyatlar - Nisan 2026 itibariyle Google'ın açıkladığı:
+        # Standard: $0.039/görsel, Batch: $0.0195/görsel
+        # Input token maliyeti negligible (~$0.0002 per görsel) - eklemiyoruz
+        # çünkü kullanıcıyı yanıltmasın, ana maliyet output görsel.
+        _cost_standard = _variation_count * 0.039
+        _cost_batch = _variation_count * 0.0195
+        # USD/TL kuru yaklaşık - kullanıcı net rakam görsün diye gösteriyoruz
+        # ama "yaklaşık" olduğunu vurguluyoruz
+        _try_rate = 36  # Yaklaşık USD/TRY - değişebilir
+        _try_standard = _cost_standard * _try_rate
+        _try_batch = _cost_batch * _try_rate
+
+        # İki sütunlu metrik gösterimi - karşılaştırma için
+        cost_col1, cost_col2 = st.columns(2)
+        with cost_col1:
+            st.metric(
+                f"💸 Standart ({_variation_count} görsel)",
+                f"${_cost_standard:.2f}",
+                f"~{_try_standard:.0f} TL",
+                delta_color="off",
+            )
+        with cost_col2:
+            st.metric(
+                f"🟢 Batch ({_variation_count} görsel)",
+                f"${_cost_batch:.2f}",
+                f"~{_try_batch:.0f} TL (-50%)",
+                delta_color="normal",
+            )
+        st.caption(
+            f"📊 Hesap: {_variation_count} görsel × $0.039 (Standard) "
+            f"veya × $0.0195 (Batch). Kur ~{_try_rate} TL/USD varsayımı. "
+            "Input token maliyeti dahil değil (~$0.0002/görsel - negligible)."
+        )
 
 st.divider()
 
