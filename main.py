@@ -49,31 +49,8 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-
-def _is_streamlit_community_cloud() -> bool:
-    """
-    Streamlit Community Cloud konteynerinde repo /mount/src altına klonlanır.
-
-    Bu path varsa çok kullanıcılı bulut dağıtımındayız demektir: varsayılan API
-    anahtarını ortamdan ASLA doldurmayız; aksi halde Secrets/.env yanlışlıkla
-    tüm ziyaretçilere aynı anahtarı verir ve fatura deploy eden kişiye yazılır.
-    """
-    try:
-        return Path("/mount/src").is_dir()
-    except OSError:
-        return False
-
-
-# Yerel geliştirme: .env → GEMINI_API_KEY. Cloud'ta .env yoktur.
 load_dotenv()
-
-if _is_streamlit_community_cloud():
-    # Güvenlik: bulutta ortam değişkenindeki anahtarı varsayılan gösterme.
-    DEFAULT_API_KEY = ""
-    IS_STREAMLIT_CLOUD = True
-else:
-    DEFAULT_API_KEY = os.getenv("GEMINI_API_KEY", "")
-    IS_STREAMLIT_CLOUD = False
+DEFAULT_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 
 # ---------------------------------------------------------------------------
@@ -137,28 +114,14 @@ _auto_reset_if_stuck()  # Her script run'ında kilitlenme kontrolü yap
 with st.sidebar:
     st.title("⚙️ Ayarlar")
 
-    # Bulut dağıtımında kullanıcıya tek cümlede güvenlik modelini anlatıyoruz.
-    if IS_STREAMLIT_CLOUD:
-        st.info(
-            "☁️ **Bulut:** Kendi Gemini API anahtarını aşağıya yapıştır. "
-            "Ücretsiz anahtar: [aistudio.google.com/apikey](https://aistudio.google.com/apikey). "
-            "Fatura anahtarı oluşturan Google hesabına yazılır; uygulama sahibine değil."
-        )
-
-    _api_key_help = (
-        "Anahtarı https://aistudio.google.com/apikey adresinden al. "
-        + (
-            "Bu ortamda .env yok; anahtarı her oturumda buraya yapıştırmalısın."
-            if IS_STREAMLIT_CLOUD
-            else "Yerelde .env içindeki GEMINI_API_KEY bu alana otomatik doldurulur."
-        )
-    )
-
     api_key_input = st.text_input(
         "Gemini API Key",
         value=DEFAULT_API_KEY,
         type="password",
-        help=_api_key_help,
+        help=(
+            "Anahtarını https://aistudio.google.com/apikey adresinden al. "
+            ".env dosyasından otomatik yükleniyor."
+        ),
     )
 
     output_dir = st.text_input(
