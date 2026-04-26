@@ -64,7 +64,8 @@ TERMINAL_STATES = {
 #  yerine kopya tutuyoruz. Refactor gerekirse ortak `prompts.py` açılabilir.)
 IMAGE_GENERATION_PREFIX = (
     "Based on the provided reference image, generate a new image "
-    "that matches the description below.\n\n"
+    "that matches the description below.\n"
+    "Do not answer with text only — output must include the generated image.\n\n"
 )
 
 
@@ -218,7 +219,7 @@ class GeminiBatchHandler:
                   ]
                 }],
                 "generation_config": {
-                  "response_modalities": ["TEXT", "IMAGE"]
+                  "response_modalities": ["IMAGE"]
                 }
               }
             }
@@ -265,10 +266,11 @@ class GeminiBatchHandler:
                                 ]
                             }
                         ],
-                        # Image generation için response_modalities ŞART
-                        # Sadece TEXT olursa görsel üretmez!
+                        # Sadece IMAGE: TEXT+IMAGE bazen modelin yalnızca metin
+                        # dönmesine yol açıyor. Standart mod ile aynı (IMAGE-only).
                         "generation_config": {
-                            "response_modalities": ["TEXT", "IMAGE"]
+                            "response_modalities": ["IMAGE"],
+                            "temperature": 0.4,
                         },
                     },
                 }

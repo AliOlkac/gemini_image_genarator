@@ -61,7 +61,8 @@ MAX_MASTER_IMAGE_BYTES = 20 * 1024 * 1024  # ~20 MiB
 # Maliyeti: ~25 token (~$0.000003) → retry maliyeti yanında negligible.
 IMAGE_GENERATION_PREFIX = (
     "Based on the provided reference image, generate a new image "
-    "that matches the description below.\n\n"
+    "that matches the description below.\n"
+    "Do not answer with text only — output must include the generated image.\n\n"
 )
 
 
@@ -215,11 +216,17 @@ class GeminiStandardHandler:
             ],
         )
 
+        # response_modalities: Sadece IMAGE — Google'ın önerdiği mod.
+        # TEXT+IMAGE bırakılırsa model bazen STOP ile sadece metin döndürüyor (~%25).
+        # IMAGE tek başına çıktıyı görsele zorlar (metin üretimi devre dışı).
+        # Kaynak: https://ai.google.dev/gemini-api/docs/image-generation
         response = self.client.models.generate_content(
             model=MODEL_NAME,
             contents=[user_content],
             config=types.GenerateContentConfig(
-                response_modalities=["TEXT", "IMAGE"],
+                response_modalities=["IMAGE"],
+                # Düşük sıcaklık: görsel üretimde daha tutarlı / daha az "metne kaçma"
+                temperature=0.4,
             ),
         )
 
