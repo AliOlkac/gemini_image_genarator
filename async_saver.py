@@ -193,8 +193,13 @@ def save_single_image_sync(
     filename = f"{payload.key}{extension}"
     file_path = output_path / filename
 
-    # Standart Python file write - hızlı ve basit
+    # Standart Python file write - hızlı ve basit.
+    # flush + fsync: Windows'ta dosya hemen okunabilir olsun (canlı grid
+    # bir sonraki satırda Image.open yapıyor; ara sıra boş slot görülmesini
+    # azaltır).
     with open(file_path, "wb") as f:
         f.write(image_bytes)
+        f.flush()
+        os.fsync(f.fileno())
 
     return file_path

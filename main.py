@@ -4,8 +4,9 @@ main.py
 Gemini 2.5 Flash Image Batcher - Streamlit Arayüzü.
 
 YENİ ÖZELLİKLER (v2):
-    - CANLI GRID: Görseller üretildikçe anında ekrana eklenir.
-    - BİREYSEL İNDİR BUTONU: Her görselin altında "İndir" butonu.
+    - Standart modda üretim sırasında ilerleme çubuğu + log; bitince tek seferde sonuç grid'i
+      (Streamlit widget key/rerun sorunlarını en aza indirir).
+    - BİREYSEL İNDİR + TOPLU ZIP: Her görsel ve paket indirme.
     - TOPLU ZIP İNDİR: Üst kısımda tüm görselleri tek paket halinde indir.
     - DAHA NET HATA MESAJLARI: SAFETY/RECITATION/MAX_TOKENS ayrımı.
 
@@ -59,12 +60,21 @@ DEFAULT_API_KEY = os.getenv("GEMINI_API_KEY", "")
 def _init_session_state() -> None:
     """Streamlit session state'ini varsayılan değerlerle başlatır."""
     defaults = {
-        "saved_paths": [],          # Üretilmiş görsellerin yolları (kalıcı)
+        # Üretilmiş görsellerin disk yolları — STRING listesi (rerun uyumu).
+        "saved_paths": [],
         "is_running": False,        # Şu an iş çalışıyor mu (çift tıklama engeli)
         "last_error": None,         # Son hata mesajı
         "last_job_name": None,      # Son batch job ismi (debug için)
         "failed_keys": [],          # Başarısız istekler
         "run_started_at": None,     # Üretim başlangıç zamanı (timestamp)
+        # file_uploader indirme/rerun sonrası None olabiliyor; master baytı sakla.
+        "master_upload_bytes": None,
+        "master_upload_name": None,
+        # Widget key'leri ile bağlı — indirme tetiklenince prompt'lar silinmesin.
+        "widget_master_prompt": "",
+        "widget_variations": "",
+        # Her yeni üretimde +1; indirme/ZIP buton key çakışmasını kesin olarak önler.
+        "_results_gen": 0,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -142,7 +152,7 @@ with st.sidebar:
         }[x],
         index=0,
         help=(
-            "Standart: Anlık üretim, canlı grid. "
+            "Standart: Anlık üretim, bitince aşağıda indirme. "
             "Batch: %50 ucuz ama 24 saate kadar sürebilir."
         ),
     )
@@ -194,7 +204,7 @@ with st.sidebar:
         st.success(
             "💡 **Standart API**\n\n"
             "- Anında sonuç (saniyeler)\n"
-            "- Canlı grid: üretildikçe görüntüle\n"
+            "- Bittiğinde aşağıda önizleme + indirme\n"
             "- **~$0.039/görsel** (tam fiyat)"
         )
     else:
@@ -257,8 +267,8 @@ with st.sidebar:
 # ===========================================================================
 st.title("🎨 Gemini 2.5 Flash Image Batcher")
 st.markdown(
-    "Master görsel + Master prompt + Varyasyonlar girerek toplu görsel üret. "
-    "Sonuçlar canlı olarak aşağıda görünür ve `outputs/` klasörüne kaydedilir."
+    "Master görsel + Master prompt + Varyasyonlar ile toplu üretim. "
+    "Dosyalar `outputs/` klasörüne yazılır; arayüzde işlem bitince indirebilirsin."
 )
 
 
@@ -269,18 +279,31 @@ col_left, col_right = st.columns([1, 1])
 
 with col_left:
     st.subheader("📤 1. Master Görsel")
+    # key= ile widget değeri session_state'te kalır; indirme/rerun sonrası
+    # uploader boş dönerse aşağıdaki önbellek devreye girer.
     uploaded_image = st.file_uploader(
         "Referans görseli yükle",
         type=["png", "jpg", "jpeg", "webp"],
         help="Tüm varyasyonlar bu görseli temel alacak.",
+        key="widget_master_file",
     )
-
     if uploaded_image is not None:
+        st.session_state.master_upload_bytes = uploaded_image.getvalue()
+        st.session_state.master_upload_name = uploaded_image.name
+
+    _preview_bytes = (
+        uploaded_image.getvalue()
+        if uploaded_image is not None
+        else st.session_state.get("master_upload_bytes")
+    )
+    if _preview_bytes:
         st.image(
-            uploaded_image,
+            _preview_bytes,
             caption="Master Görsel Önizleme",
             width="stretch",
         )
+        if uploaded_image is None and st.session_state.get("master_upload_bytes"):
+            st.caption("📌 Önbellekteki görsel (yeniden yüklemeden üretebilirsin).")
 
 with col_right:
     st.subheader("✍️ 2. Master Prompt")
@@ -298,6 +321,7 @@ with col_right:
             "Sen sadece sahnenin/varyasyonun ne olacağını anlat - "
             "model'e komut vermeyi bize bırakabilirsin."
         ),
+        key="widget_master_prompt",
     )
 
     # Auto-prefix kapalıysa ve kullanıcı imperatif yazmadıysa uyar.
@@ -326,6 +350,7 @@ with col_right:
             "Gece sahnesi, neon ışıklar\n"
             "Ormanlık alan, yağmurlu hava"
         ),
+        key="widget_variations",
     )
 
     # --- CANLI MALİYET TAHMİNİ ---
@@ -389,7 +414,7 @@ start_button = st.button(
 # ===========================================================================
 def _validate_inputs(
     api_key: str,
-    image_file,
+    has_master_image: bool,
     prompt: str,
     variations_raw: str,
 ) -> list[str]:
@@ -398,8 +423,8 @@ def _validate_inputs(
 
     if not api_key or "YOUR_API_KEY" in api_key.upper():
         errors.append("Geçerli bir API anahtarı gerekli (sidebar veya .env).")
-    if image_file is None:
-        errors.append("Master görsel yüklenmemiş.")
+    if not has_master_image:
+        errors.append("Master görsel yüklenmemiş (veya oturumda önbellek yok).")
     if not prompt.strip():
         errors.append("Master prompt boş olamaz.")
     if not variations_raw.strip():
@@ -415,6 +440,55 @@ def _save_uploaded_to_temp(uploaded_file) -> Path:
     tmp.write(uploaded_file.getbuffer())
     tmp.close()
     return Path(tmp.name)
+
+
+def _save_bytes_to_temp(data: bytes, suffix: str) -> Path:
+    """Ham baytları geçici dosyaya yazar (önbellekten master görsel için)."""
+    if not suffix.startswith("."):
+        suffix = f".{suffix}"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp.write(data)
+    tmp.close()
+    return Path(tmp.name)
+
+
+def _paths_from_session_saved() -> list[Path]:
+    """saved_paths oturum değerini Path listesine çevirir (str veya Path kabul)."""
+    raw = st.session_state.get("saved_paths") or []
+    return [Path(str(p)) for p in raw]
+
+
+def _invalidate_zip_cache() -> None:
+    """Yeni üretim başlarken ZIP önbelleğini temizle."""
+    st.session_state.pop("_zip_cache_sig", None)
+    st.session_state.pop("_zip_cache_bytes", None)
+
+
+def _zip_bytes_cached(paths: list[Path]) -> bytes:
+    """
+    Aynı dosya seti için ZIP'i tekrar tekrar üretmeyi önler.
+    Canlı grid her görselde yeniden çizildiğinde 20 görseli ZIP'lemek
+    UI'ı kilitler ve hatalara yol açar.
+    """
+    try:
+        sig = tuple(
+            (str(p.resolve()), p.stat().st_size, int(p.stat().st_mtime_ns))
+            for p in paths
+            if p.exists()
+        )
+    except OSError:
+        sig = tuple(str(p) for p in paths)
+
+    if (
+        st.session_state.get("_zip_cache_sig") == sig
+        and st.session_state.get("_zip_cache_bytes") is not None
+    ):
+        return st.session_state["_zip_cache_bytes"]
+
+    data = _make_zip_bytes(paths)
+    st.session_state["_zip_cache_sig"] = sig
+    st.session_state["_zip_cache_bytes"] = data
+    return data
 
 
 def _make_zip_bytes(paths: list[Path]) -> bytes:
@@ -438,38 +512,31 @@ def _make_zip_bytes(paths: list[Path]) -> bytes:
     return buffer.getvalue()
 
 
-def _render_live_grid(
+def _render_results_grid(
     placeholder: "st.delta_generator.DeltaGenerator",
     paths: list[Path],
 ) -> None:
     """
-    Canlı grid'i çizer veya günceller.
+    Sonuç görsellerini TEK blokta çizer (önizleme + ZIP + tekil indir).
 
-    YENIDEN ÇİZİM STRATEJİSİ:
-        Her yeni görsel geldiğinde tüm grid baştan çiziliyor.
-        Streamlit'in delta diff'leme mantığı sayesinde görsel olarak
-        sadece değişen kısımlar update olur (performans dostu).
+    TASARIM: Standart akışta döngü içinde BURAYI ÇAĞIRMA — her tamamlanan
+    görselde tüm grid'i yeniden kurmak Streamlit'te key/rerun sorunlarını
+    çoğaltır. Üretim bitince saved_paths dolu → script sonunda bir kez çağrılır.
 
-    Args:
-        placeholder: st.empty() ile oluşturulmuş placeholder.
-        paths: Şu ana kadar üretilmiş görsel yolları.
+    Widget key'leri _results_gen ile benzersiz: yeni üretimde eski butonlarla
+    asla çakışmaz (StreamlitDuplicateElementKey önlemi).
     """
     if not paths:
-        # Boş ise placeholder'ı temizle
         placeholder.empty()
         return
 
+    placeholder.empty()
+    gen = int(st.session_state.get("_results_gen", 0))
+
     with placeholder.container():
-        # ----- ÜST KISIMDA TOPLU ZIP İNDİR BUTONU -----
         st.markdown(f"### 🖼️ Üretilen Görseller ({len(paths)})")
 
-        zip_bytes = _make_zip_bytes(paths)
-        # KEY NEDEN DİNAMİK?
-        # _render_live_grid streaming sırasında defalarca çağrılır.
-        # Streamlit key'leri session bazlı takip eder. Aynı key iki kez
-        # görünürse "duplicate key" hatası fırlar. Görsel sayısını key'e
-        # ekleyince her çağrıda FARKLI bir key üretiliyor → çakışma yok.
-        zip_key = f"zip_dl_{len(paths)}"
+        zip_bytes = _zip_bytes_cached(paths)
         st.download_button(
             label=f"📦 Hepsini ZIP olarak indir ({len(paths)} görsel)",
             data=zip_bytes,
@@ -477,13 +544,13 @@ def _render_live_grid(
             mime="application/zip",
             width="stretch",
             type="secondary",
-            key=zip_key,
+            key=f"results_zip_g{gen}",
         )
 
-        st.markdown("")  # küçük boşluk
+        st.markdown("")
 
-        # ----- 4 SÜTUNLU GÖRSEL GRİDİ -----
         cols_per_row = 4
+        global_idx = 0
 
         for row_start in range(0, len(paths), cols_per_row):
             row_paths = paths[row_start : row_start + cols_per_row]
@@ -492,47 +559,75 @@ def _render_live_grid(
             for col, path in zip(cols, row_paths):
                 with col:
                     try:
-                        img = Image.open(path)
+                        # Dosya yeni yazıldıysa (özellikle Windows) kısa gecikmeyle
+                        # tekrar dene; aksi halde grid'de boş kutu görülebilir.
+                        img = None
+                        last_err: Exception | None = None
+                        for _attempt in range(5):
+                            try:
+                                img = Image.open(path)
+                                img.load()
+                                break
+                            except Exception as err:
+                                last_err = err
+                                time.sleep(0.06)
+                        if img is None:
+                            raise last_err or RuntimeError(path.name)
+
                         st.image(
                             img,
                             caption=path.name,
                             width="stretch",
                         )
 
-                        # ----- BİREYSEL İNDİR BUTONU -----
                         with open(path, "rb") as f:
                             image_bytes = f.read()
 
                         suffix = path.suffix.lstrip(".").lower()
                         mime = f"image/{'jpeg' if suffix == 'jpg' else suffix}"
 
-                        # len(paths) + row_start + path.stem kombinasyonu:
-                        # Her _render_live_grid çağrısında paths sayısı farklı
-                        # olduğu için key her seferinde unique oluyor.
-                        dl_key = f"dl_{len(paths)}_{row_start}_{path.stem}"
                         st.download_button(
                             label="💾 İndir",
                             data=image_bytes,
                             file_name=path.name,
                             mime=mime,
-                            key=dl_key,
+                            key=f"results_dl_g{gen}_{global_idx}",
                             width="stretch",
                         )
+                        global_idx += 1
                     except Exception as e:
                         st.error(f"{path.name}: {e}")
+                        global_idx += 1
 
 
 # ===========================================================================
-# CANLI GRID PLACEHOLDER - üretim başlamadan ÖNCE oluşturulmalı.
-# Streamlit script'i yukarıdan aşağı çalıştırır - bu yüzden grid'in
-# görüneceği konumu burada rezerve ediyoruz.
+# SONUÇ ALANI — üretim bittikten sonra tek seferde doldurulur (st.empty).
 # ===========================================================================
 st.divider()
+st.caption(
+    "📥 **Sonuçlar:** Üretim sürerken ilerleme yukarıda; bittiğinde görseller "
+    "burada önizlenir ve indirilebilir."
+)
 live_grid_placeholder = st.empty()
 
-# Eğer önceki çalıştırmadan görseller varsa onları göster
-if st.session_state.saved_paths and not st.session_state.is_running:
-    _render_live_grid(live_grid_placeholder, st.session_state.saved_paths)
+
+def _draw_results_section() -> None:
+    """
+    Script sonunda: üretim yoksa alanı temizle; varsa grid'i bir kez çiz.
+
+    Önceki üretim sidebar'dan silindiğinde saved_paths=[] olur — placeholder
+    boşaltılmazsa eski görseller ekranda kalır; bu yüzden boşta da empty() şart.
+    """
+    if st.session_state.is_running:
+        return
+    paths = _paths_from_session_saved()
+    if not paths:
+        live_grid_placeholder.empty()
+        return
+    _render_results_grid(live_grid_placeholder, paths)
+
+
+# Script sonunda çağrılır: önce start_button bloğu state'i yazar, sonra grid çizilir.
 
 
 # ===========================================================================
@@ -544,7 +639,6 @@ def _run_batch_flow(
     master_prompt: str,
     variations_list: list[str],
     output_dir: str,
-    grid_placeholder,
     use_auto_prefix: bool = True,
 ) -> tuple[list[Path], list[str]]:
     """
@@ -599,9 +693,7 @@ def _run_batch_flow(
     st.write(f"💾 {len(payloads)} görsel paralel olarak diske yazılıyor...")
     saved_paths = save_all_images_sync(payloads=payloads, output_dir=output_dir)
 
-    # Grid'i bir kerede çiz
-    st.session_state.saved_paths = saved_paths
-    _render_live_grid(grid_placeholder, saved_paths)
+    # Grid, script sonunda _draw_results_section ile çizilir (tek yol).
 
     handler.cleanup()
     return saved_paths, []
@@ -617,19 +709,13 @@ def _run_standard_flow(
     variations_list: list[str],
     workers: int,
     output_dir: str,
-    grid_placeholder,
     use_auto_prefix: bool = True,
 ) -> tuple[list[Path], list[str]]:
     """
-    Standart API: Paralel üretim + her görsel anında diske + canlı grid update.
+    Standart API: Paralel üretim + her görsel anında diske yazılır.
 
-    AKIŞ:
-        1. Handler hazırla, master upload (ACTIVE bekle).
-        2. Generator'u tüket - her tamamlanan istek:
-           a. Progress bar update.
-           b. Log alanına satır ekle.
-           c. Yeni payload ANINDA diske yaz.
-           d. Grid'i yeniden çiz (yeni görsel dahil).
+    UI: Döngüde sadece ilerleme + log — grid/indirme yok (Streamlit stabilitesi).
+    Bittiğinde saved_paths dolar; script sonunda tek seferde grid çizilir.
     """
     st.write("🔧 Gemini Standart istemcisi hazırlanıyor...")
     handler = GeminiStandardHandler(api_key=api_key)
@@ -645,10 +731,8 @@ def _run_standard_flow(
     log_area = st.empty()
     log_lines: list[str] = []
 
-    # Stream süresince biriken yollar
-    saved_paths_so_far: list[Path] = list(st.session_state.saved_paths)
-    # Önceki üretimi sıfırla - yeni session başlıyor
-    saved_paths_so_far = []
+    # Bu koşu için sıfırdan biriken disk yolları (Path; session'a string olarak yazılır).
+    saved_paths_so_far: list[Path] = []
 
     # Hangi payload'lar zaten kaydedildi (index bazlı takip)
     last_saved_count = 0
@@ -684,11 +768,8 @@ def _run_standard_flow(
 
             last_saved_count = current_payload_count
 
-            # Session state'i güncelle (rerun durumunda kayıp önle)
-            st.session_state.saved_paths = saved_paths_so_far.copy()
-
-            # ----- 4) Grid'i yenile - YENİ GÖRSEL DAHIL -----
-            _render_live_grid(grid_placeholder, saved_paths_so_far)
+            # Ara kayıt: çökme olursa kısmi sonuç diskte kalır; grid yine sonda çizilir.
+            st.session_state.saved_paths = [str(p) for p in saved_paths_so_far]
 
     # Stream bitti - genel özet
     failed = handler.failed_keys
@@ -709,9 +790,13 @@ def _run_standard_flow(
 #                              ANA İŞ AKIŞI
 # ===========================================================================
 if start_button:
+    # Uploader rerun/indirme sonrası boş dönebilir; bayt önbelleği varsa yine geçerli.
+    has_master_image = uploaded_image is not None or bool(
+        st.session_state.get("master_upload_bytes")
+    )
     validation_errors = _validate_inputs(
         api_key_input,
-        uploaded_image,
+        has_master_image,
         master_prompt,
         variations_text,
     )
@@ -726,50 +811,67 @@ if start_button:
         st.session_state.last_error = None
         st.session_state.saved_paths = []
         st.session_state.failed_keys = []
+        # Önceki üretimin ZIP önbelleği yeni koşuda yanlışlıkla kullanılmasın.
+        _invalidate_zip_cache()
+        # Yeni widget nesli — indirme butonları önceki koşu ile asla aynı key'i paylaşmaz.
+        st.session_state["_results_gen"] = int(
+            st.session_state.get("_results_gen", 0)
+        ) + 1
 
-        # Live grid placeholder'ı temizle
+        # Sonuç alanını boşalt; üretim bitince tek parça grid basılacak.
         live_grid_placeholder.empty()
 
         variations_list = [
             v.strip() for v in variations_text.splitlines() if v.strip()
         ]
-        master_temp_path = _save_uploaded_to_temp(uploaded_image)
+        # Master dosya: yüklü dosya varsa ondan; yoksa oturumdaki baytlardan temp üret.
+        if uploaded_image is not None:
+            master_temp_path = _save_uploaded_to_temp(uploaded_image)
+        else:
+            _mb = st.session_state.get("master_upload_bytes")
+            _mn = st.session_state.get("master_upload_name") or "master.png"
+            master_temp_path = _save_bytes_to_temp(
+                _mb, Path(_mn).suffix or ".png"
+            )
 
         try:
-            with st.status(
-                f"{mode_label} işlemi başlatılıyor...",
-                expanded=True,
-            ) as status:
-
-                if api_mode == "batch":
+            # Standart mod: st.status İÇİNDE grid güncellenirse kutu kapanınca içerik
+            # kayboluyor gibi davranır; indirme de tam rerun tetikler — grid ana akışta kalsın.
+            if api_mode == "batch":
+                with st.status(
+                    f"{mode_label} işlemi başlatılıyor...",
+                    expanded=True,
+                ) as status:
                     saved_paths, failed_keys = _run_batch_flow(
                         api_key=api_key_input,
                         master_temp_path=master_temp_path,
                         master_prompt=master_prompt,
                         variations_list=variations_list,
                         output_dir=output_dir,
-                        grid_placeholder=live_grid_placeholder,
                         use_auto_prefix=use_auto_prefix,
                     )
-                else:
-                    saved_paths, failed_keys = _run_standard_flow(
-                        api_key=api_key_input,
-                        master_temp_path=master_temp_path,
-                        master_prompt=master_prompt,
-                        variations_list=variations_list,
-                        workers=max_workers or 2,
-                        output_dir=output_dir,
-                        grid_placeholder=live_grid_placeholder,
-                        use_auto_prefix=use_auto_prefix,
+                    st.session_state.saved_paths = [str(p) for p in saved_paths]
+                    st.session_state.failed_keys = failed_keys
+                    status.update(
+                        label=f"✅ {len(saved_paths)} görsel başarıyla üretildi!",
+                        state="complete",
+                        expanded=False,
                     )
-
-                st.session_state.saved_paths = saved_paths
+            else:
+                saved_paths, failed_keys = _run_standard_flow(
+                    api_key=api_key_input,
+                    master_temp_path=master_temp_path,
+                    master_prompt=master_prompt,
+                    variations_list=variations_list,
+                    workers=max_workers or 2,
+                    output_dir=output_dir,
+                    use_auto_prefix=use_auto_prefix,
+                )
+                st.session_state.saved_paths = [str(p) for p in saved_paths]
                 st.session_state.failed_keys = failed_keys
-
-                status.update(
-                    label=f"✅ {len(saved_paths)} görsel başarıyla üretildi!",
-                    state="complete",
-                    expanded=False,
+                st.success(
+                    f"✅ {len(saved_paths)} görsel hazır; aşağıdan indirebilirsin.",
+                    icon="✅",
                 )
 
         except Exception as exc:
@@ -791,6 +893,12 @@ if start_button:
                 master_temp_path.unlink(missing_ok=True)
             except Exception:
                 pass
+
+
+# ===========================================================================
+#                         SONUÇ GRİDİ (tek çizim noktası)
+# ===========================================================================
+_draw_results_section()
 
 
 # ===========================================================================
