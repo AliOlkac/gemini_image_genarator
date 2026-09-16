@@ -27,7 +27,8 @@ from __future__ import annotations
 
 import base64
 import mimetypes
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
@@ -35,14 +36,13 @@ from typing import Iterator
 from google import genai
 from google.genai import types
 
+from app_config import HTTP_TIMEOUT_MS, MODEL_NAME, build_prompt, is_placeholder_key
 from async_saver import ImagePayload
 
 
 # ---------------------------------------------------------------------------
-# Sabitler - batch_handler ile aynı modeli kullanıyoruz, ekstra mantık yok.
+# Sabitler - model adı ve prompt öneki app_config.py'de (iki mod ortak).
 # ---------------------------------------------------------------------------
-MODEL_NAME = "gemini-2.5-flash-image"
-
 # Free tier'a saygılı varsayılan: dakikada 5-10 istek limit'inde 2 worker güvenli.
 # Kullanıcı UI'dan değiştirebilir (1-5 aralığında).
 DEFAULT_MAX_WORKERS = 2
@@ -51,19 +51,6 @@ DEFAULT_MAX_WORKERS = 2
 # Gemini istek gövdesi sınırları için; aşarsak kullanıcıyı net uyarırız.
 # (Çok büyük görsellerde yine de sıkıştırma / küçültme önerilir.)
 MAX_MASTER_IMAGE_BYTES = 20 * 1024 * 1024  # ~20 MiB
-
-# OTOMATİK GÖRSEL-ÜRET PREFIX'İ:
-# Test edilmiş en güçlü formül - 3 katmanlı sinyal:
-#   1) "Based on the provided reference image" → master image'ı referans olarak işaretler
-#   2) "generate a new image" → imperatif komut (modelin "text mi image mi?" tereddüdünü kırar)
-#   3) "that matches the description below" → açıklamayı GÖRSEL KRİTERİ olarak okutur
-# İngilizce çünkü Gemini'nin imperatif komut anlama performansı İngilizce'de daha güçlü.
-# Maliyeti: ~25 token (~$0.000003) → retry maliyeti yanında negligible.
-IMAGE_GENERATION_PREFIX = (
-    "Based on the provided reference image, generate a new image "
-    "that matches the description below.\n"
-    "Do not answer with text only — output must include the generated image.\n\n"
-)
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +68,13 @@ class StandardProgress:
     # field(default_factory=list) → mutable default için doğru kullanım.
     # Yoksa tüm instance'lar AYNI listeyi paylaşır (klasik Python tuzağı).
     failed_keys: list[str] = field(default_factory=list)
+    # Bu paketin ait olduğu varyasyon (1'den başlayan sıra) ve sonucu.
+    # payload ya da error dolu olur; iptal edilen istekte ikisi de boş kalır.
+    index: int = 0
+    variation: str = ""
+    payload: ImagePayload | None = None
+    error: str | None = None
+    cancelled: bool = False
 
 
 # ===========================================================================
@@ -104,13 +98,17 @@ class GeminiStandardHandler:
             api_key: Gemini API anahtarı.
         """
         # Placeholder kontrolü - batch_handler ile aynı mantık
-        if not api_key or "YOUR_API_KEY" in api_key.upper():
+        if is_placeholder_key(api_key):
             raise ValueError(
                 "API anahtarı geçerli değil. .env dosyasındaki "
                 "GEMINI_API_KEY değerini kendi anahtarınla değiştir."
             )
 
-        self.client = genai.Client(api_key=api_key)
+        # timeout: kopan bir bağlantı worker'ı sonsuza kadar kilitlemesin.
+        self.client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=HTTP_TIMEOUT_MS),
+        )
 
         # Master görsel: Files API yok; bellekte ham baytlar + MIME.
         self._master_image_bytes: bytes | None = None
@@ -200,8 +198,7 @@ class GeminiStandardHandler:
             )
 
         # PROMPT BİRLEŞTİRME: [opsiyonel auto prefix] + master_prompt + varyasyon.
-        prefix = IMAGE_GENERATION_PREFIX if use_auto_prefix else ""
-        combined = f"{prefix}{master_prompt.strip()}\n\nVaryasyon: {variation}"
+        combined = build_prompt(master_prompt, variation, use_auto_prefix)
 
         # Tek kullanıcı mesajı: önce referans görsel (inline), sonra metin.
         # Files API kullanmıyoruz — resumable upload hatalarından kaçınmak için.
@@ -313,6 +310,7 @@ class GeminiStandardHandler:
         variations: list[str],
         max_workers: int = DEFAULT_MAX_WORKERS,
         use_auto_prefix: bool = True,
+        cancel_event: threading.Event | None = None,
     ) -> Iterator[StandardProgress]:
         """
         Tüm varyasyonları ThreadPoolExecutor ile paralel üretir.
@@ -324,15 +322,22 @@ class GeminiStandardHandler:
         Bittikten sonra sonuçlar self.payloads ve self.failed_keys'te durur.
         Generator dışından bunlara erişerek async_saver'a verebilirsin.
 
+        İPTAL:
+            cancel_event set edilince henüz BAŞLAMAMIŞ istekler iptal edilir
+            (cancelled=True paketiyle bildirilir). O an sunucuda işlenen istekler
+            zaten ücretlendiği için bitmeleri beklenir ve sonuçları yine yield
+            edilir — parası ödenmiş görsel çöpe gitmesin.
+
         Args:
             master_prompt: Sabit metin.
             variations: Varyasyon listesi.
             max_workers: Eşzamanlı thread sayısı (1-5 önerilir).
             use_auto_prefix: Görsel-üret prefix'ini ekle (varsayılan True).
                 Modelin "STOP-without-image" davranışını ~%80 azaltır.
+            cancel_event: Opsiyonel iptal sinyali.
 
         Yields:
-            Her tamamlanan istek için bir StandardProgress.
+            Her tamamlanan (veya iptal edilen) istek için bir StandardProgress.
         """
         if self._master_image_bytes is None:
             raise RuntimeError("Önce upload_master_image() çağırmalısın.")
@@ -350,7 +355,8 @@ class GeminiStandardHandler:
 
         # ThreadPoolExecutor: I/O-bound iş için ideal (HTTP isteği bekliyoruz çoğunu).
         # GIL CPU-bound'da problem olur ama burada thread'ler çoğu zaman uyukluyor.
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        try:
             # Tüm istekleri schedule ediyoruz - hepsi worker'lara dağılacak.
             # future -> (idx, variation) eşleşmesini sözlükte tutuyoruz ki
             # tamamlandığında hangi istek olduğunu bilelim.
@@ -364,34 +370,70 @@ class GeminiStandardHandler:
                 ): (idx, var)
                 for idx, var in enumerate(cleaned, start=1)
             }
+            pending = set(future_map)
+            cancel_handled = False
 
-            # as_completed: future'ları TAMAMLANMA SIRASINA göre yield eder
-            # (submit sırasına göre değil!). Bu sayede ilk biten ilk gösterilir.
-            for future in as_completed(future_map):
-                idx, var = future_map[future]
-                key = f"req-{idx:03d}"
-                completed += 1
+            while pending:
+                # Kısa timeout: iptal isteği, uzun süren bir üretimin bitmesini
+                # beklemeden fark edilsin (boşa çıkan worker'lar sıradakini almadan).
+                done, pending = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
 
-                try:
-                    # _generate_one ya ImagePayload döner ya da raise eder.
-                    # Artık None dönmüyor → "BOS" log'u kalktı, hep net mesaj var.
-                    result = future.result()
-                    self.payloads.append(result)
-                    # Varyasyonun ilk 40 karakterini göster (UI sığması için)
-                    msg = f"[OK] {key}: {var[:40]}"
-                except Exception as exc:
-                    # API hatası, safety, rate limit vb. - hepsi exception olarak gelir
-                    self.failed_keys.append(key)
-                    # Hata mesajını 100 karakterle sınırla (eski 60 çok kısaydı)
-                    msg = f"[HATA] {key}: {str(exc)[:100]}"
+                if (
+                    not cancel_handled
+                    and cancel_event is not None
+                    and cancel_event.is_set()
+                ):
+                    cancel_handled = True
+                    # cancel() sadece henüz başlamamış istekler için True döner.
+                    for future in [f for f in pending if f.cancel()]:
+                        pending.discard(future)
+                        idx, var = future_map[future]
+                        completed += 1
+                        yield StandardProgress(
+                            completed=completed,
+                            total=total,
+                            last_message=f"[IPTAL] req-{idx:03d}: {var[:40]}",
+                            failed_keys=self.failed_keys.copy(),
+                            index=idx,
+                            variation=var,
+                            cancelled=True,
+                        )
 
-                # UI'a tek bir ilerleme paketi yield et
-                yield StandardProgress(
-                    completed=completed,
-                    total=total,
-                    last_message=msg,
-                    failed_keys=self.failed_keys.copy(),
-                )
+                # Tamamlanma sırasına göre (submit sırasına göre değil) bildir.
+                for future in done:
+                    idx, var = future_map[future]
+                    key = f"req-{idx:03d}"
+                    completed += 1
+                    payload: ImagePayload | None = None
+                    error: str | None = None
+
+                    try:
+                        # _generate_one ya ImagePayload döner ya da raise eder.
+                        payload = future.result()
+                        self.payloads.append(payload)
+                        # Varyasyonun ilk 40 karakterini göster (UI sığması için)
+                        msg = f"[OK] {key}: {var[:40]}"
+                    except Exception as exc:
+                        # API hatası, safety, rate limit vb. - hepsi exception olarak gelir
+                        self.failed_keys.append(key)
+                        error = str(exc)[:500]
+                        msg = f"[HATA] {key}: {str(exc)[:100]}"
+
+                    yield StandardProgress(
+                        completed=completed,
+                        total=total,
+                        last_message=msg,
+                        failed_keys=self.failed_keys.copy(),
+                        index=idx,
+                        variation=var,
+                        payload=payload,
+                        error=error,
+                    )
+        finally:
+            # Generator erken kapatılırsa (tüketici hata verdi / vazgeçti) kuyruktaki
+            # başlamamış istekler GÖNDERİLMESİN. Eskiden `with` bloğu burada tüm
+            # kuyruğun bitmesini bekliyordu: istekler faturalanıyor, sonuçlar atılıyordu.
+            executor.shutdown(wait=False, cancel_futures=True)
 
     # -----------------------------------------------------------------------
     # Temizlik (best-effort, batch_handler ile simetrik)
