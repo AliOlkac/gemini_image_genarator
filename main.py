@@ -3,16 +3,20 @@ main.py
 =======
 Gemini 2.5 Flash Image Batcher - Streamlit Arayüzü.
 
-YENİ ÖZELLİKLER (v2):
-    - Standart modda üretim sırasında ilerleme çubuğu + log; bitince tek seferde sonuç grid'i
-      (Streamlit widget key/rerun sorunlarını en aza indirir).
-    - BİREYSEL İNDİR + TOPLU ZIP: Her görsel ve paket indirme.
-    - TOPLU ZIP İNDİR: Üst kısımda tüm görselleri tek paket halinde indir.
-    - DAHA NET HATA MESAJLARI: SAFETY/RECITATION/MAX_TOKENS ayrımı.
+MİMARİ (v3):
+    - Arayüz formu gösterir ve iş kaydı oluşturur; üretimi job_manager ARKA PLANDA
+      yürütür. Sayfayı yenilemek, başka bir şeye basmak ya da sekmeyi kapatmak
+      çalışan işi etkilemez.
+    - Her kullanıcı bir profil seçer (adres çubuğunda ?u=isim). Form alanları,
+      referans görsel ve üretimler profile özel olarak diskte saklanır; iki kişi
+      aynı anda kullansa da görseller karışmaz.
+    - API anahtarı .env dosyasına kaydedilir; yenileme / yeniden başlatma sonrası
+      da durur.
+    - Batch job'lar tarayıcı kapalı olsa bile takip edilir, bitince otomatik iner.
 
 İKİ MOD DESTEĞİ:
-    1. Standart API (Paid Tier - anında, canlı grid)
-    2. Batch API (%50 indirimli, yavaş, toplu görüntüleme)
+    1. Standart API (anında)
+    2. Batch API (%50 indirimli, dakikalar - 24 saat)
 
 ÇALIŞTIRMA:
     streamlit run main.py
@@ -20,24 +24,28 @@ YENİ ÖZELLİKLER (v2):
 
 from __future__ import annotations
 
+import functools
+import hashlib
 import io
-import os
-import tempfile
 import time
 import zipfile
+from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import streamlit as st
-from dotenv import load_dotenv
-from PIL import Image
 
-from async_saver import save_all_images_sync, save_single_image_sync
-from batch_handler import GeminiBatchHandler
-from standard_handler import GeminiStandardHandler
-
-if TYPE_CHECKING:
-    from async_saver import ImagePayload
+import storage
+from app_config import (
+    DEFAULT_OUTPUT_DIR,
+    MODEL_NAME,
+    PRICE_PER_IMAGE_BATCH,
+    PRICE_PER_IMAGE_STANDARD,
+    get_api_key,
+    key_fingerprint,
+    mask_key,
+    save_api_key,
+)
+from job_manager import HOSTNAME, PROCESS_TOKEN, get_manager
 
 
 # ---------------------------------------------------------------------------
@@ -50,94 +58,223 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-load_dotenv()
-DEFAULT_API_KEY = os.getenv("GEMINI_API_KEY", "")
+# Arka plan işleri + batch takipçisi. Süreç başına bir kez oluşur; tüm
+# kullanıcılar ve sayfa yenilemeleri aynı yöneticiyi paylaşır.
+manager = get_manager()
+
+MODE_LABELS = {"standard": "Standart", "batch": "Batch"}
+STATUS_LABELS = {
+    "queued": "⏳ Sırada",
+    "running": "⚡ Üretiliyor",
+    "submitting": "📤 Google'a gönderiliyor",
+    "waiting": "🕒 Google'da işleniyor",
+    "downloading": "📥 Sonuçlar indiriliyor",
+    "done": "✅ Tamamlandı",
+    "partial": "🟡 Kısmen tamamlandı",
+    "failed": "❌ Başarısız",
+    "cancelled": "⏹️ İptal edildi",
+    "interrupted": "⚠️ Yarıda kaldı",
+}
+BATCH_STATE_LABELS = {
+    "JOB_STATE_QUEUED": "kuyrukta bekliyor",
+    "JOB_STATE_PENDING": "kuyrukta bekliyor",
+    "JOB_STATE_RUNNING": "görseller üretiliyor",
+    "JOB_STATE_SUCCEEDED": "tamamlandı",
+    "JOB_STATE_CANCELLING": "iptal ediliyor",
+}
+FORM_DEFAULTS = {
+    "master_prompt": "",
+    "variations": "",
+    "api_mode": "standart",
+    "max_workers": 3,
+    "use_auto_prefix": True,
+    "output_dir": DEFAULT_OUTPUT_DIR,
+}
+# Aynı iş bu süre içinde tekrar başlatılırsa çift tıklama sayılır.
+DUPLICATE_WINDOW_SECONDS = 10
+# Devam eden işler paneli kaç saniyede bir yenilensin.
+LIVE_REFRESH_SECONDS = 3
 
 
-# ---------------------------------------------------------------------------
-# Session state başlatma - rerun'larda state kaybolmasın diye
-# ---------------------------------------------------------------------------
-def _init_session_state() -> None:
-    """Streamlit session state'ini varsayılan değerlerle başlatır."""
-    defaults = {
-        # Üretilmiş görsellerin disk yolları — STRING listesi (rerun uyumu).
-        "saved_paths": [],
-        "is_running": False,        # Şu an iş çalışıyor mu (çift tıklama engeli)
-        "last_error": None,         # Son hata mesajı
-        "last_job_name": None,      # Son batch job ismi (debug için)
-        "failed_keys": [],          # Başarısız istekler
-        "run_started_at": None,     # Üretim başlangıç zamanı (timestamp)
-        # file_uploader indirme/rerun sonrası None olabiliyor; master baytı sakla.
-        "master_upload_bytes": None,
-        "master_upload_name": None,
-        # Widget key'leri ile bağlı — indirme tetiklenince prompt'lar silinmesin.
-        "widget_master_prompt": "",
-        "widget_variations": "",
-        # Her yeni üretimde +1; indirme/ZIP buton key çakışmasını kesin olarak önler.
-        "_results_gen": 0,
+# ===========================================================================
+#                              YARDIMCI FONKSİYONLAR
+# ===========================================================================
+def _fmt_time(ts: float | None) -> str:
+    return datetime.fromtimestamp(ts).strftime("%d.%m %H:%M") if ts else "?"
+
+
+def _fmt_duration(seconds: float) -> str:
+    minutes, secs = divmod(int(max(seconds, 0)), 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} sa {minutes} dk" if hours else f"{minutes} dk {secs} sn"
+
+
+def _fmt_ago(ts: float | None) -> str:
+    return f"{int(time.time() - ts)} sn önce" if ts else "henüz yok"
+
+
+def _validate_inputs(has_master_image: bool, prompt: str, variations: list[str]) -> list[str]:
+    """Form girdilerini doğrular, hata listesi döner."""
+    errors: list[str] = []
+    if not has_master_image:
+        errors.append("Master görsel yüklenmemiş.")
+    if not prompt.strip():
+        errors.append("Master prompt boş olamaz.")
+    if not variations:
+        errors.append("En az bir varyasyon satırı gerekli.")
+    return errors
+
+
+def _zip_builder(paths: list[Path]):
+    """İndirme butonuna verilecek, TIKLANINCA çalışan ZIP üretici (her rerun'da değil)."""
+    def build() -> bytes:
+        buffer = io.BytesIO()
+        # Görseller zaten sıkıştırılmış; ZIP_STORED hızlı ve boyut farkı yok denecek kadar az.
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_STORED) as zf:
+            for path in paths:
+                if path.exists():
+                    zf.write(path, arcname=path.name)
+        return buffer.getvalue()
+
+    return build
+
+
+def _load_form_into_session(profile: dict) -> None:
+    """
+    Profilin kayıtlı form değerlerini widget'lara yükler (yenileme sonrası geri gelir).
+
+    Sadece profil değişince değil, widget değeri oturumda YOKSA da diskten
+    yükler: Streamlit, st.rerun() ile yarıda kesilen bir çalıştırmada çizilmemiş
+    widget'ların değerini siler. Bu kontrol olmasa form varsayılanlara döner ve
+    boş değerler profile yazılırdı.
+    """
+    st.session_state.setdefault("_uploader_nonce", 0)
+    switched = st.session_state.get("_loaded_profile") != profile["slug"]
+    form = {**FORM_DEFAULTS, **(profile.get("form") or {})}
+    values = {
+        "widget_master_prompt": str(form["master_prompt"]),
+        "widget_variations": str(form["variations"]),
+        "widget_api_mode": form["api_mode"] if form["api_mode"] in ("standart", "batch") else "standart",
+        "widget_max_workers": int(min(5, max(1, int(form["max_workers"])))),
+        "widget_auto_prefix": bool(form["use_auto_prefix"]),
+        "widget_output_dir": str(form["output_dir"] or DEFAULT_OUTPUT_DIR),
     }
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
+    for widget_key, value in values.items():
+        if switched or widget_key not in st.session_state:
+            st.session_state[widget_key] = value
+    st.session_state["_loaded_profile"] = profile["slug"]
 
 
-# ---------------------------------------------------------------------------
-# OTOMATİK KILITLENME ÇÖZÜCÜ
-# Streamlit bir widget'a tıklanınca scripti baştan çalıştırır.
-# Eğer o sırada is_running=True iken script yarım kaldıysa (finally çalışmadı),
-# buton kalıcı disabled kalır. Çözüm: belirli süre geçtiyse otomatik sıfırla.
-# ---------------------------------------------------------------------------
-_RUN_TIMEOUT_SECONDS = 600  # 10 dakika - Batch'in bile bu kadar uzun sürmesi şüpheli
-
-def _auto_reset_if_stuck() -> None:
-    """
-    is_running=True takılı kaldıysa otomatik sıfırlar.
-
-    Streamlit'in rerun döngüsünde her script çalıştığında bu fonksiyon
-    kontrol yapar. run_started_at'tan bu yana 10 dakika geçtiyse ve
-    hâlâ is_running=True ise → kimse gözetmeden bir şeyler kilitlenmiş →
-    sıfırla, kullanıcı yeniden başlatabilsin.
-    """
-    if not st.session_state.is_running:
-        return  # Sorun yok, çalışmıyor zaten
-
-    started = st.session_state.get("run_started_at")
-    if started is None:
-        # Timestamp yok ama is_running=True → eski state kalıntısı → sıfırla
-        st.session_state.is_running = False
-        return
-
-    elapsed = time.time() - started
-    if elapsed > _RUN_TIMEOUT_SECONDS:
-        # 10 dakika geçmiş, hâlâ "çalışıyor" → kilitlenmiş
-        st.session_state.is_running = False
-        st.session_state.run_started_at = None
+def _set_variations(text: str) -> None:
+    """Buton callback'i: widget oluşturulmadan önce çalıştığı için değeri değiştirebilir."""
+    st.session_state["widget_variations"] = text
 
 
-_init_session_state()
-_auto_reset_if_stuck()  # Her script run'ında kilitlenme kontrolü yap
+def _remove_master_callback(slug: str) -> None:
+    storage.clear_profile_master(slug)
+    # Uploader'ın key'i değişir → içindeki eski dosya da temizlenir.
+    st.session_state["_uploader_nonce"] = st.session_state.get("_uploader_nonce", 0) + 1
 
 
 # ===========================================================================
-#                              SIDEBAR
+#                              PROFİL SEÇİMİ
 # ===========================================================================
+def _render_profile_picker() -> None:
+    st.title("🎨 Gemini 2.5 Flash Image Batcher")
+    st.subheader("👤 Kim kullanıyor?")
+    st.caption(
+        "Her kullanıcının formu, referans görseli ve üretimleri ayrı tutulur. "
+        "Aynı anda birden fazla kişi kullanabilir; görseller birbirine karışmaz."
+    )
+
+    profiles = storage.list_profiles()
+    if profiles:
+        cols = st.columns(min(len(profiles), 4))
+        for i, profile in enumerate(profiles):
+            with cols[i % len(cols)]:
+                if st.button(profile["name"], key=f"pick_{profile['slug']}", width="stretch"):
+                    st.query_params["u"] = profile["slug"]
+                    st.rerun()
+
+    with st.form("new_profile", clear_on_submit=True):
+        name = st.text_input("Yeni kullanıcı", placeholder="Örn: Ali")
+        if st.form_submit_button("Başla", type="primary"):
+            try:
+                profile = storage.create_profile(name)
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                st.query_params["u"] = profile["slug"]
+                st.rerun()
+
+
+profile_slug = st.query_params.get("u")
+profile = storage.get_profile(profile_slug) if profile_slug else None
+if profile is None:
+    _render_profile_picker()
+    st.stop()
+
+_load_form_into_session(profile)
+api_key = get_api_key()
+
+
+# ===========================================================================
+#                                  SIDEBAR
+# ===========================================================================
+def _save_api_key_callback() -> None:
+    # Callback script'ten ÖNCE çalışır: st.rerun() gerekmez, form yarıda kesilmez.
+    try:
+        save_api_key(st.session_state.get("widget_new_api_key", ""))
+    except ValueError as exc:
+        st.session_state["_api_key_message"] = ("error", str(exc))
+    else:
+        st.session_state["_api_key_message"] = ("saved", "API anahtarı kaydedildi.")
+
+
+def _api_key_form(button_label: str) -> None:
+    # clear_on_submit: anahtar kaydedildikten sonra kutuda/oturumda kalmaz.
+    with st.form("api_key_form", clear_on_submit=True, border=False):
+        st.text_input(
+            "Gemini API Key",
+            type="password",
+            key="widget_new_api_key",
+            help=(
+                "Anahtarını https://aistudio.google.com/apikey adresinden al. "
+                "Proje klasöründeki .env dosyasına kaydedilir; sayfa yenilense "
+                "ya da uygulama yeniden başlasa da silinmez."
+            ),
+        )
+        st.form_submit_button(button_label, on_click=_save_api_key_callback)
+
+
 with st.sidebar:
     st.title("⚙️ Ayarlar")
 
-    api_key_input = st.text_input(
-        "Gemini API Key",
-        value=DEFAULT_API_KEY,
-        type="password",
-        help=(
-            "Anahtarını https://aistudio.google.com/apikey adresinden al. "
-            ".env dosyasından otomatik yükleniyor."
-        ),
-    )
+    user_col, switch_col = st.columns([3, 2], vertical_alignment="center")
+    user_col.markdown(f"👤 **{profile['name']}**")
+    if switch_col.button("Değiştir", key="switch_profile", width="stretch"):
+        st.query_params.clear()
+        st.session_state.pop("_loaded_profile", None)
+        st.rerun()
+
+    st.subheader("🔑 API Anahtarı")
+    api_key_message = st.session_state.pop("_api_key_message", None)
+    if api_key_message and api_key_message[0] == "error":
+        st.error(api_key_message[1])
+    elif api_key_message:
+        st.toast(api_key_message[1], icon="🔑")
+    if api_key:
+        st.success(f"Kayıtlı anahtar: `{mask_key(api_key)}`")
+        with st.expander("Anahtarı değiştir"):
+            _api_key_form("Yeni anahtarı kaydet")
+    else:
+        st.warning("API anahtarı kayıtlı değil. Üretim için önce kaydet.")
+        _api_key_form("Kaydet")
 
     output_dir = st.text_input(
         "Çıktı klasörü",
-        value="outputs",
-        help="Üretilen görsellerin kaydedileceği yerel klasör.",
+        key="widget_output_dir",
+        help="Görseller <klasör>/<kullanıcı>/<iş>/ altına, her iş ayrı klasöre kaydedilir.",
     )
 
     st.divider()
@@ -150,40 +287,34 @@ with st.sidebar:
             "standart": "Standart API (anında)",
             "batch": "Batch API (%50 ucuz, yavaş)",
         }[x],
-        index=0,
+        key="widget_api_mode",
         help=(
-            "Standart: Anlık üretim, bitince aşağıda indirme. "
-            "Batch: %50 ucuz ama 24 saate kadar sürebilir."
+            "Standart: Anlık üretim. "
+            "Batch: %50 ucuz ama 24 saate kadar sürebilir; sayfayı kapatsan da "
+            "arka planda takip edilir ve bitince otomatik indirilir."
         ),
     )
 
-    # --- Standart-mod'a özel ayar: paralel worker sayısı ---
     # Batch'te geçerli değil çünkü Google sunucusu zaten paralelize ediyor.
-    # NOT: Retry mekanizması bilinçli olarak KALDIRILDI - bug durumunda istek
-    # sayısının patlamaması için. Auto-prefix tek savunma hattı; başarısız
-    # varyasyonu kullanıcı manuel olarak tekrar denemekle yükümlü.
-    if api_mode == "standart":
-        max_workers = st.slider(
-            "Eş zamanlı istek sayısı",
-            min_value=1,
-            max_value=5,
-            value=3,
-            help=(
-                "Daha yüksek = daha hızlı ama 429 (rate limit) riski. "
-                "Paid tier için 3 dengeli."
-            ),
-        )
-    else:
-        max_workers = None
+    # Batch modunda da çiziliyor (disabled): çizilmeyen widget'ın değeri Streamlit
+    # tarafından siliniyor, standarda dönünce ayar kaybolmasın.
+    max_workers = st.slider(
+        "Eş zamanlı istek sayısı",
+        min_value=1,
+        max_value=5,
+        key="widget_max_workers",
+        disabled=api_mode == "batch",
+        help=(
+            "Daha yüksek = daha hızlı ama 429 (rate limit) riski. "
+            "Paid tier için 3 dengeli. Batch modunda kullanılmaz."
+        ),
+    )
 
-    # --- Her İKİ MOD için ortak ayar: auto-prefix ---
-    # Hem Standart hem Batch'te aynı modeli (gemini-2.5-flash-image) çağırıyoruz,
-    # dolayısıyla "STOP-without-image" sorunu her ikisinde de var. Çözüm de aynı:
-    # imperatif prompt prefix'i. UI'da tek checkbox - kullanıcı her iki modda da
-    # aynı kontrolü görsün diye if dışında.
+    # Hem Standart hem Batch'te aynı modeli çağırıyoruz, dolayısıyla
+    # "STOP-without-image" sorunu ikisinde de var; çözüm de aynı: imperatif önek.
     use_auto_prefix = st.checkbox(
         "🎯 Otomatik 'görsel üret' öneki ekle",
-        value=True,
+        key="widget_auto_prefix",
         help=(
             "Master prompt'unun başına şu cümle eklenir:\n\n"
             "\"Based on the provided reference image, generate a new "
@@ -197,113 +328,99 @@ with st.sidebar:
 
     st.divider()
 
-    # FİYAT NOTU: Tüm rakamlar Nisan 2026 itibariyle resmi Google fiyat sayfasından.
-    # Her görsel = 1290 output token × $30/1M = tam $0.039 (Standard).
+    # FİYAT NOTU: Her görsel = 1290 output token × $30/1M = $0.039 (Standard).
     # Batch %50 indirimle $0.0195/görsel.
     if api_mode == "standart":
         st.success(
             "💡 **Standart API**\n\n"
             "- Anında sonuç (saniyeler)\n"
-            "- Bittiğinde aşağıda önizleme + indirme\n"
-            "- **~$0.039/görsel** (tam fiyat)"
+            "- Arka planda çalışır; sayfayı yenilemek işi durdurmaz\n"
+            f"- **~${PRICE_PER_IMAGE_STANDARD}/görsel** (tam fiyat)"
         )
     else:
         st.warning(
             "⚠️ **Batch API**\n\n"
-            "- **~$0.0195/görsel** (%50 indirim)\n"
+            f"- **~${PRICE_PER_IMAGE_BATCH}/görsel** (%50 indirim)\n"
             "- Dakikalar - 24 saat arası sürebilir\n"
-            "- Sonuç toplu görüntülenir"
+            "- Sayfayı kapatabilirsin; bitince otomatik indirilir"
         )
 
-    # --- CANLI MALİYET TAHMİNİ ---
-    # Kullanıcı varyasyon yazdıkça anında "ne kadar para harcayacağım?" görsün.
-    # st.session_state üzerinden değil, doğrudan widget değerinden okuyamayız
-    # çünkü main akıştaki text_area henüz çalışmadı; bunu form altında
-    # ayrıca render edeceğiz (variations_text doluyken).
     st.divider()
-    st.caption(
-        "💰 **Maliyet ipucu**: Varyasyon listeni yazdıktan sonra "
-        "form altında canlı tahmin göreceksin."
+    st.subheader("🛟 Kurtarma")
+    import_clicked = st.button(
+        "🔎 Hesaptaki batch işlerini tara",
+        width="stretch",
+        disabled=not api_key,
+        help=(
+            "Google hesabındaki, bu listede olmayan görsel batch job'larını bulur ve "
+            "senin işlerine ekler. Eskiden sayfa kapandığı için sonucu indirilmemiş "
+            "job'lar bitmişse otomatik indirilir."
+        ),
     )
+    if import_clicked:
+        with st.spinner("Google hesabındaki batch işleri taranıyor..."):
+            try:
+                counts = manager.import_account_batches(
+                    owner=profile["slug"], output_base=output_dir
+                )
+            except Exception as exc:
+                st.error(f"Tarama başarısız: {exc}")
+            else:
+                found = counts["imported"] + counts["relinked"]
+                if found:
+                    st.success(
+                        f"{found} batch işi listeye eklendi. Bitmiş olanlar birkaç "
+                        "saniye içinde indirilecek."
+                    )
+                else:
+                    st.info("Takip edilmeyen yeni bir görsel batch işi bulunamadı.")
 
-    st.divider()
-
-    # --- "Başlat" butonu takılı kaldıysa manuel sıfırlama ---
-    # is_running=True iken script yarım kalırsa buton kalıcı disabled olur.
-    # Otomatik sıfırlama 10 dk bekler; bu buton ANINDA kurtarır.
-    if st.session_state.is_running:
-        st.warning("⏳ Üretim çalışıyor veya askıda kaldı.")
-        if st.button(
-            "🔓 Butonu Kilidden Çıkar",
-            help=(
-                "Üretim butonunu takılı kaldıysa serbest bırakır. "
-                "Çalışan bir işlem varsa o iptal OLMAZ, sadece buton aktifleşir."
-            ),
-            width="stretch",
-            type="secondary",
-        ):
-            st.session_state.is_running = False
-            st.session_state.run_started_at = None
-            st.rerun()
-
-    # Önceki üretimi temizleme butonu
-    if st.session_state.saved_paths:
-        if st.button(
-            "🗑️ Önceki üretimi temizle",
-            help="Sayfadaki görselleri kaldırır (dosyalar diskte kalır).",
-            width="stretch",
-        ):
-            st.session_state.saved_paths = []
-            st.session_state.failed_keys = []
-            st.session_state.last_error = None
-            st.rerun()
-
-    st.caption("Model: `gemini-2.5-flash-image`")
+    st.caption(f"Model: `{MODEL_NAME}`")
     st.caption("SDK: `google-genai`")
 
 
 # ===========================================================================
-#                              ANA SAYFA
+#                                ANA SAYFA
 # ===========================================================================
 st.title("🎨 Gemini 2.5 Flash Image Batcher")
 st.markdown(
     "Master görsel + Master prompt + Varyasyonlar ile toplu üretim. "
-    "Dosyalar `outputs/` klasörüne yazılır; arayüzde işlem bitince indirebilirsin."
+    "İşler arka planda çalışır; sayfayı yenilesen de kaldığı yerden görürsün."
 )
 
-
-# ---------------------------------------------------------------------------
-# Form alanları - 2 sütunlu düzen
-# ---------------------------------------------------------------------------
 col_left, col_right = st.columns([1, 1])
 
 with col_left:
     st.subheader("📤 1. Master Görsel")
-    # key= ile widget değeri session_state'te kalır; indirme/rerun sonrası
-    # uploader boş dönerse aşağıdaki önbellek devreye girer.
+    # Nonce: "Görseli kaldır" sonrası uploader'ı da boşaltmak için key değişir.
     uploaded_image = st.file_uploader(
         "Referans görseli yükle",
         type=["png", "jpg", "jpeg", "webp"],
-        help="Tüm varyasyonlar bu görseli temel alacak.",
-        key="widget_master_file",
+        help="Tüm varyasyonlar bu görseli temel alacak. Yüklenen görsel profiline kaydedilir.",
+        key=f"widget_master_file_{st.session_state['_uploader_nonce']}",
     )
     if uploaded_image is not None:
-        st.session_state.master_upload_bytes = uploaded_image.getvalue()
-        st.session_state.master_upload_name = uploaded_image.name
+        uploaded_bytes = uploaded_image.getvalue()
+        if (profile.get("master") or {}).get("sha1") != hashlib.sha1(uploaded_bytes).hexdigest():
+            profile = storage.save_profile_master(
+                profile["slug"], uploaded_bytes, uploaded_image.name
+            ) or profile
 
-    _preview_bytes = (
-        uploaded_image.getvalue()
-        if uploaded_image is not None
-        else st.session_state.get("master_upload_bytes")
-    )
-    if _preview_bytes:
+    master_path = storage.profile_master_path(profile)
+    if master_path is not None:
         st.image(
-            _preview_bytes,
-            caption="Master Görsel Önizleme",
+            str(master_path),
+            caption=f"Master Görsel: {profile['master']['name']}",
             width="stretch",
         )
-        if uploaded_image is None and st.session_state.get("master_upload_bytes"):
-            st.caption("📌 Önbellekteki görsel (yeniden yüklemeden üretebilirsin).")
+        if uploaded_image is None:
+            st.caption("📌 Kayıtlı görsel kullanılıyor (sayfa yenilense de durur).")
+        st.button(
+            "🗑️ Görseli kaldır",
+            key="remove_master",
+            on_click=_remove_master_callback,
+            args=(profile["slug"],),
+        )
 
 with col_right:
     st.subheader("✍️ 2. Master Prompt")
@@ -318,26 +435,19 @@ with col_right:
             "💡 Otomatik önek varsayılan olarak AÇIK (sidebar'dan görebilirsin). "
             "Yani senin yazdığın prompt'un başına model'i 'görsel üret' "
             "demeye zorlayan İngilizce kısa bir cümle ekleniyor. "
-            "Sen sadece sahnenin/varyasyonun ne olacağını anlat - "
-            "model'e komut vermeyi bize bırakabilirsin."
+            "Sen sadece sahnenin/varyasyonun ne olacağını anlat."
         ),
         key="widget_master_prompt",
     )
 
     # Auto-prefix kapalıysa ve kullanıcı imperatif yazmadıysa uyar.
-    # Auto-prefix açıksa zaten model komut alıyor, uyarı gerekmez.
     if not use_auto_prefix and master_prompt.strip():
-        _prompt_hint_keywords = [
-            "üret", "generate", "create", "draw", "produce", "make"
-        ]
-        _has_imperative = any(
-            kw in master_prompt.lower() for kw in _prompt_hint_keywords
-        )
-        if not _has_imperative:
+        _prompt_hint_keywords = ["üret", "generate", "create", "draw", "produce", "make"]
+        if not any(kw in master_prompt.lower() for kw in _prompt_hint_keywords):
             st.caption(
                 "⚠️ Otomatik önek kapalı ve prompt'unda 'görsel üret' "
                 "benzeri bir komut göremedim. Başarı oranı düşebilir - "
-                "ya sidebar'dan oneki aç ya da prompt'una imperatif komut ekle."
+                "ya sidebar'dan öneki aç ya da prompt'una imperatif komut ekle."
             )
 
     st.subheader("🔀 3. Varyasyonlar")
@@ -352,559 +462,317 @@ with col_right:
         ),
         key="widget_variations",
     )
+    variations_list = [line.strip() for line in variations_text.splitlines() if line.strip()]
 
     # --- CANLI MALİYET TAHMİNİ ---
-    # Kullanıcı varyasyon yazdıkça anında "ne kadar para harcayacağım?" görsün.
-    # Boş satırları sayma (kullanıcı genelde bırakır).
-    _variation_count = sum(
-        1 for line in variations_text.splitlines() if line.strip()
-    )
-    if _variation_count > 0:
-        # Resmi fiyatlar - Nisan 2026 itibariyle Google'ın açıkladığı:
-        # Standard: $0.039/görsel, Batch: $0.0195/görsel
-        # Input token maliyeti negligible (~$0.0002 per görsel) - eklemiyoruz
-        # çünkü kullanıcıyı yanıltmasın, ana maliyet output görsel.
-        _cost_standard = _variation_count * 0.039
-        _cost_batch = _variation_count * 0.0195
-        # USD/TL kuru yaklaşık - kullanıcı net rakam görsün diye gösteriyoruz
-        # ama "yaklaşık" olduğunu vurguluyoruz
+    if variations_list:
+        _variation_count = len(variations_list)
+        _cost_standard = _variation_count * PRICE_PER_IMAGE_STANDARD
+        _cost_batch = _variation_count * PRICE_PER_IMAGE_BATCH
         _try_rate = 36  # Yaklaşık USD/TRY - değişebilir
-        _try_standard = _cost_standard * _try_rate
-        _try_batch = _cost_batch * _try_rate
 
-        # İki sütunlu metrik gösterimi - karşılaştırma için
         cost_col1, cost_col2 = st.columns(2)
         with cost_col1:
             st.metric(
                 f"💸 Standart ({_variation_count} görsel)",
                 f"${_cost_standard:.2f}",
-                f"~{_try_standard:.0f} TL",
+                f"~{_cost_standard * _try_rate:.0f} TL",
                 delta_color="off",
             )
         with cost_col2:
             st.metric(
                 f"🟢 Batch ({_variation_count} görsel)",
                 f"${_cost_batch:.2f}",
-                f"~{_try_batch:.0f} TL (-50%)",
+                f"~{_cost_batch * _try_rate:.0f} TL (-50%)",
                 delta_color="normal",
             )
+        # \$: markdown iki $ arasını LaTeX formülü sanıp metni bozuyordu.
         st.caption(
-            f"📊 Hesap: {_variation_count} görsel × $0.039 (Standard) "
-            f"veya × $0.0195 (Batch). Kur ~{_try_rate} TL/USD varsayımı. "
-            "Input token maliyeti dahil değil (~$0.0002/görsel - negligible)."
+            f"📊 Hesap: {_variation_count} görsel × \\${PRICE_PER_IMAGE_STANDARD} (Standard) "
+            f"veya × \\${PRICE_PER_IMAGE_BATCH} (Batch). Kur yaklaşık {_try_rate} TL/USD varsayımı. "
+            "Input token maliyeti dahil değil (yaklaşık \\$0.0002/görsel - negligible)."
         )
+
+# Form değerlerini profile yaz: sayfa yenilense ya da uygulama kapansa da geri gelir.
+_form_values = {
+    "master_prompt": master_prompt,
+    "variations": variations_text,
+    "api_mode": api_mode,
+    "max_workers": int(max_workers),
+    "use_auto_prefix": bool(use_auto_prefix),
+    "output_dir": output_dir,
+}
+if (profile.get("form") or {}) != _form_values:
+    storage.update_profile(profile["slug"], lambda p: p.update(form=_form_values))
 
 st.divider()
 
 
 # ---------------------------------------------------------------------------
-# Üretimi Başlat butonu
+# Üretimi Başlat
 # ---------------------------------------------------------------------------
-mode_label = "Standart" if api_mode == "standart" else "Batch"
+run_mode = "standard" if api_mode == "standart" else "batch"
 start_button = st.button(
-    f"🚀 Üretimi Başlat ({mode_label} Mod)",
+    f"🚀 Üretimi Başlat ({MODE_LABELS[run_mode]} Mod)",
     type="primary",
     width="stretch",
-    disabled=st.session_state.is_running,
+    disabled=not api_key,
 )
+if not api_key:
+    st.caption("🔑 Başlatmak için önce sidebar'dan API anahtarını kaydet.")
 
-
-# ===========================================================================
-#                              YARDIMCI FONKSİYONLAR
-# ===========================================================================
-def _validate_inputs(
-    api_key: str,
-    has_master_image: bool,
-    prompt: str,
-    variations_raw: str,
-) -> list[str]:
-    """Form girdilerini doğrular, hata listesi döner."""
-    errors: list[str] = []
-
-    if not api_key or "YOUR_API_KEY" in api_key.upper():
-        errors.append("Geçerli bir API anahtarı gerekli (sidebar veya .env).")
-    if not has_master_image:
-        errors.append("Master görsel yüklenmemiş (veya oturumda önbellek yok).")
-    if not prompt.strip():
-        errors.append("Master prompt boş olamaz.")
-    if not variations_raw.strip():
-        errors.append("En az bir varyasyon satırı gerekli.")
-
-    return errors
-
-
-def _save_uploaded_to_temp(uploaded_file) -> Path:
-    """Streamlit UploadedFile'ı geçici diske yazar (Files API yol bekler)."""
-    suffix = Path(uploaded_file.name).suffix or ".png"
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    tmp.write(uploaded_file.getbuffer())
-    tmp.close()
-    return Path(tmp.name)
-
-
-def _save_bytes_to_temp(data: bytes, suffix: str) -> Path:
-    """Ham baytları geçici dosyaya yazar (önbellekten master görsel için)."""
-    if not suffix.startswith("."):
-        suffix = f".{suffix}"
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    tmp.write(data)
-    tmp.close()
-    return Path(tmp.name)
-
-
-def _paths_from_session_saved() -> list[Path]:
-    """saved_paths oturum değerini Path listesine çevirir (str veya Path kabul)."""
-    raw = st.session_state.get("saved_paths") or []
-    return [Path(str(p)) for p in raw]
-
-
-def _invalidate_zip_cache() -> None:
-    """Yeni üretim başlarken ZIP önbelleğini temizle."""
-    st.session_state.pop("_zip_cache_sig", None)
-    st.session_state.pop("_zip_cache_bytes", None)
-
-
-def _zip_bytes_cached(paths: list[Path]) -> bytes:
-    """
-    Aynı dosya seti için ZIP'i tekrar tekrar üretmeyi önler.
-    Canlı grid her görselde yeniden çizildiğinde 20 görseli ZIP'lemek
-    UI'ı kilitler ve hatalara yol açar.
-    """
-    try:
-        sig = tuple(
-            (str(p.resolve()), p.stat().st_size, int(p.stat().st_mtime_ns))
-            for p in paths
-            if p.exists()
-        )
-    except OSError:
-        sig = tuple(str(p) for p in paths)
-
-    if (
-        st.session_state.get("_zip_cache_sig") == sig
-        and st.session_state.get("_zip_cache_bytes") is not None
-    ):
-        return st.session_state["_zip_cache_bytes"]
-
-    data = _make_zip_bytes(paths)
-    st.session_state["_zip_cache_sig"] = sig
-    st.session_state["_zip_cache_bytes"] = data
-    return data
-
-
-def _make_zip_bytes(paths: list[Path]) -> bytes:
-    """
-    Verilen path listesindeki tüm dosyaları ZIP olarak paketler.
-
-    Streamlit download_button'a verilebilir bytes döner.
-    Bellekte ZIP oluşturuyoruz (BytesIO) - diske yazmıyoruz.
-    50 görsel için ~100ms, kabul edilebilir.
-    """
-    buffer = io.BytesIO()
-    # ZIP_DEFLATED: dosyaları sıkıştır (görseller zaten sıkıştırılmış olduğu için
-    # az fayda var ama yine de bir miktar kazanç). ZIP_STORED da olur.
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for path in paths:
-            # arcname: ZIP içindeki dosya adı (klasör yapısını dahil etme)
-            zf.write(path, arcname=path.name)
-
-    # Buffer pozisyonunu başa al ve bytes oku
-    buffer.seek(0)
-    return buffer.getvalue()
-
-
-def _render_results_grid(
-    placeholder: "st.delta_generator.DeltaGenerator",
-    paths: list[Path],
-) -> None:
-    """
-    Sonuç görsellerini TEK blokta çizer (önizleme + ZIP + tekil indir).
-
-    TASARIM: Standart akışta döngü içinde BURAYI ÇAĞIRMA — her tamamlanan
-    görselde tüm grid'i yeniden kurmak Streamlit'te key/rerun sorunlarını
-    çoğaltır. Üretim bitince saved_paths dolu → script sonunda bir kez çağrılır.
-
-    Widget key'leri _results_gen ile benzersiz: yeni üretimde eski butonlarla
-    asla çakışmaz (StreamlitDuplicateElementKey önlemi).
-    """
-    if not paths:
-        placeholder.empty()
-        return
-
-    placeholder.empty()
-    gen = int(st.session_state.get("_results_gen", 0))
-
-    with placeholder.container():
-        st.markdown(f"### 🖼️ Üretilen Görseller ({len(paths)})")
-
-        zip_bytes = _zip_bytes_cached(paths)
-        st.download_button(
-            label=f"📦 Hepsini ZIP olarak indir ({len(paths)} görsel)",
-            data=zip_bytes,
-            file_name="gemini_images.zip",
-            mime="application/zip",
-            width="stretch",
-            type="secondary",
-            key=f"results_zip_g{gen}",
-        )
-
-        st.markdown("")
-
-        cols_per_row = 4
-        global_idx = 0
-
-        for row_start in range(0, len(paths), cols_per_row):
-            row_paths = paths[row_start : row_start + cols_per_row]
-            cols = st.columns(cols_per_row)
-
-            for col, path in zip(cols, row_paths):
-                with col:
-                    try:
-                        # Dosya yeni yazıldıysa (özellikle Windows) kısa gecikmeyle
-                        # tekrar dene; aksi halde grid'de boş kutu görülebilir.
-                        img = None
-                        last_err: Exception | None = None
-                        for _attempt in range(5):
-                            try:
-                                img = Image.open(path)
-                                img.load()
-                                break
-                            except Exception as err:
-                                last_err = err
-                                time.sleep(0.06)
-                        if img is None:
-                            raise last_err or RuntimeError(path.name)
-
-                        st.image(
-                            img,
-                            caption=path.name,
-                            width="stretch",
-                        )
-
-                        with open(path, "rb") as f:
-                            image_bytes = f.read()
-
-                        suffix = path.suffix.lstrip(".").lower()
-                        mime = f"image/{'jpeg' if suffix == 'jpg' else suffix}"
-
-                        st.download_button(
-                            label="💾 İndir",
-                            data=image_bytes,
-                            file_name=path.name,
-                            mime=mime,
-                            key=f"results_dl_g{gen}_{global_idx}",
-                            width="stretch",
-                        )
-                        global_idx += 1
-                    except Exception as e:
-                        st.error(f"{path.name}: {e}")
-                        global_idx += 1
-
-
-# ===========================================================================
-# SONUÇ ALANI — üretim bittikten sonra tek seferde doldurulur (st.empty).
-# ===========================================================================
-st.divider()
-st.caption(
-    "📥 **Sonuçlar:** Üretim sürerken ilerleme yukarıda; bittiğinde görseller "
-    "burada önizlenir ve indirilebilir."
-)
-live_grid_placeholder = st.empty()
-
-
-def _draw_results_section() -> None:
-    """
-    Script sonunda: üretim yoksa alanı temizle; varsa grid'i bir kez çiz.
-
-    Önceki üretim sidebar'dan silindiğinde saved_paths=[] olur — placeholder
-    boşaltılmazsa eski görseller ekranda kalır; bu yüzden boşta da empty() şart.
-    """
-    if st.session_state.is_running:
-        return
-    paths = _paths_from_session_saved()
-    if not paths:
-        live_grid_placeholder.empty()
-        return
-    _render_results_grid(live_grid_placeholder, paths)
-
-
-# Script sonunda çağrılır: önce start_button bloğu state'i yazar, sonra grid çizilir.
-
-
-# ===========================================================================
-#                          BATCH MOD AKIŞI
-# ===========================================================================
-def _run_batch_flow(
-    api_key: str,
-    master_temp_path: Path,
-    master_prompt: str,
-    variations_list: list[str],
-    output_dir: str,
-    use_auto_prefix: bool = True,
-) -> tuple[list[Path], list[str]]:
-    """
-    Batch API: JSONL üret, job başlat, polling, sonuç indir, kaydet.
-    Batch'te sonuçlar TOPLU geliyor; canlı grid stream yapılamıyor.
-    Sadece bittiğinde grid'i bir kerede çiziyoruz.
-
-    Args:
-        use_auto_prefix: True ise her JSONL satırının prompt'unun başına
-            görsel-üret prefix'i eklenir (Standard mode ile simetrik).
-    """
-    st.write("🔧 Gemini Batch istemcisi hazırlanıyor...")
-    handler = GeminiBatchHandler(api_key=api_key)
-
-    st.write("📤 Master görsel Files API'ye yükleniyor (ACTIVE bekleniyor)...")
-    handler.upload_master_image(master_temp_path)
-
-    st.write(f"📝 {len(variations_list)} varyasyon için JSONL üretiliyor...")
-    jsonl_path = handler.build_jsonl(
-        master_prompt=master_prompt,
-        variations=variations_list,
-        output_path="batch_requests.jsonl",
-        use_auto_prefix=use_auto_prefix,
-    )
-
-    st.write("🚀 Batch Job başlatılıyor...")
-    job_name = handler.start_batch_job(jsonl_path=jsonl_path)
-    st.session_state.last_job_name = job_name
-    st.write(f"✅ Job oluşturuldu: `{job_name}`")
-
-    st.write("⏳ Job durumu takip ediliyor (uzun sürebilir)...")
-    progress_bar = st.progress(0, text="Başlatılıyor...")
-
-    final_progress = None
-    for progress in handler.poll_until_complete():
-        final_progress = progress
-        pct = {
-            "JOB_STATE_PENDING": 0.1,
-            "JOB_STATE_RUNNING": 0.5,
-        }.get(progress.state, 1.0)
-        progress_bar.progress(pct, text=progress.message)
-
-    if final_progress and final_progress.state != "JOB_STATE_SUCCEEDED":
-        raise RuntimeError(f"Batch job başarısız: {final_progress.message}")
-
-    st.write("📥 Sonuç dosyası indiriliyor...")
-    payloads = handler.fetch_results()
-
-    if not payloads:
-        raise RuntimeError("Sonuç dosyasında görsel bulunamadı.")
-
-    st.write(f"💾 {len(payloads)} görsel paralel olarak diske yazılıyor...")
-    saved_paths = save_all_images_sync(payloads=payloads, output_dir=output_dir)
-
-    # Grid, script sonunda _draw_results_section ile çizilir (tek yol).
-
-    handler.cleanup()
-    return saved_paths, []
-
-
-# ===========================================================================
-#                         STANDART MOD AKIŞI (CANLI GRID)
-# ===========================================================================
-def _run_standard_flow(
-    api_key: str,
-    master_temp_path: Path,
-    master_prompt: str,
-    variations_list: list[str],
-    workers: int,
-    output_dir: str,
-    use_auto_prefix: bool = True,
-) -> tuple[list[Path], list[str]]:
-    """
-    Standart API: Paralel üretim + her görsel anında diske yazılır.
-
-    UI: Döngüde sadece ilerleme + log — grid/indirme yok (Streamlit stabilitesi).
-    Bittiğinde saved_paths dolar; script sonunda tek seferde grid çizilir.
-    """
-    st.write("🔧 Gemini Standart istemcisi hazırlanıyor...")
-    handler = GeminiStandardHandler(api_key=api_key)
-
-    st.write("📤 Master görsel Files API'ye yükleniyor (ACTIVE bekleniyor)...")
-    handler.upload_master_image(master_temp_path)
-
-    total = len(variations_list)
-    st.write(f"⚡ {total} varyasyon, {workers} paralel worker ile üretiliyor...")
-
-    # İlerleme barı + log alanı
-    progress_bar = st.progress(0, text="Başlatılıyor...")
-    log_area = st.empty()
-    log_lines: list[str] = []
-
-    # Bu koşu için sıfırdan biriken disk yolları (Path; session'a string olarak yazılır).
-    saved_paths_so_far: list[Path] = []
-
-    # Hangi payload'lar zaten kaydedildi (index bazlı takip)
-    last_saved_count = 0
-
-    for prog in handler.generate_all_streaming(
-        master_prompt=master_prompt,
-        variations=variations_list,
-        max_workers=workers,
-        use_auto_prefix=use_auto_prefix,
-    ):
-        # ----- 1) Progress bar -----
-        pct = prog.completed / prog.total
-        progress_bar.progress(
-            pct,
-            text=f"{prog.completed}/{prog.total} - {prog.last_message}",
-        )
-
-        # ----- 2) Log alanı (son 8 satır kaydırarak) -----
-        log_lines.append(prog.last_message)
-        log_area.code("\n".join(log_lines[-8:]), language=None)
-
-        # ----- 3) Yeni payload var mı? Diske yaz + grid yenile -----
-        # handler.payloads stream sırasında dolup gidiyor; biz bir adım gerideyiz.
-        current_payload_count = len(handler.payloads)
-        if current_payload_count > last_saved_count:
-            # Yeni gelen tüm payload'ları kaydet (genelde 1 tane ama
-            # birkaç worker aynı anda bitirdiyse birden fazla olabilir)
-            new_payloads = handler.payloads[last_saved_count:current_payload_count]
-            for new_payload in new_payloads:
-                # Tek görseli senkron kaydet (hızlı, blocking değil pratikte)
-                saved_path = save_single_image_sync(new_payload, output_dir)
-                saved_paths_so_far.append(saved_path)
-
-            last_saved_count = current_payload_count
-
-            # Ara kayıt: çökme olursa kısmi sonuç diskte kalır; grid yine sonda çizilir.
-            st.session_state.saved_paths = [str(p) for p in saved_paths_so_far]
-
-    # Stream bitti - genel özet
-    failed = handler.failed_keys
-    if not saved_paths_so_far:
-        raise RuntimeError(
-            "Hiçbir varyasyon başarılı olamadı. Log'a bak."
-        )
-
-    st.write(f"🎉 {len(saved_paths_so_far)}/{total} görsel başarıyla üretildi.")
-    if failed:
-        st.warning(f"⚠️ {len(failed)} istek başarısız: {', '.join(failed)}")
-
-    handler.cleanup()
-    return saved_paths_so_far, failed
-
-
-# ===========================================================================
-#                              ANA İŞ AKIŞI
-# ===========================================================================
 if start_button:
-    # Uploader rerun/indirme sonrası boş dönebilir; bayt önbelleği varsa yine geçerli.
-    has_master_image = uploaded_image is not None or bool(
-        st.session_state.get("master_upload_bytes")
-    )
-    validation_errors = _validate_inputs(
-        api_key_input,
-        has_master_image,
-        master_prompt,
-        variations_text,
-    )
-
+    validation_errors = _validate_inputs(master_path is not None, master_prompt, variations_list)
     if validation_errors:
         for err in validation_errors:
             st.error(f"❌ {err}")
     else:
-        # State sıfırla
-        st.session_state.is_running = True
-        st.session_state.run_started_at = time.time()  # Kilitlenme tespiti için
-        st.session_state.last_error = None
-        st.session_state.saved_paths = []
-        st.session_state.failed_keys = []
-        # Önceki üretimin ZIP önbelleği yeni koşuda yanlışlıkla kullanılmasın.
-        _invalidate_zip_cache()
-        # Yeni widget nesli — indirme butonları önceki koşu ile asla aynı key'i paylaşmaz.
-        st.session_state["_results_gen"] = int(
-            st.session_state.get("_results_gen", 0)
-        ) + 1
-
-        # Sonuç alanını boşalt; üretim bitince tek parça grid basılacak.
-        live_grid_placeholder.empty()
-
-        variations_list = [
-            v.strip() for v in variations_text.splitlines() if v.strip()
-        ]
-        # Master dosya: yüklü dosya varsa ondan; yoksa oturumdaki baytlardan temp üret.
-        if uploaded_image is not None:
-            master_temp_path = _save_uploaded_to_temp(uploaded_image)
+        fingerprint = hashlib.sha1(
+            "\x1f".join([
+                run_mode,
+                master_prompt.strip(),
+                "\n".join(variations_list),
+                str(use_auto_prefix),
+                profile["master"]["sha1"],
+            ]).encode("utf-8")
+        ).hexdigest()
+        # Çift tıklama koruması sunucu tarafında: aynı iş birkaç saniye içinde
+        # ikinci kez oluşturulmaz (buton durumu tarayıcıda gecikmeli güncellenir).
+        duplicate = any(
+            r.get("fingerprint") == fingerprint
+            and r.get("status") != "failed"
+            and time.time() - r.get("created_at", 0) < DUPLICATE_WINDOW_SECONDS
+            for r in storage.list_runs(owner=profile["slug"])
+        )
+        if duplicate:
+            st.warning("Bu iş az önce başlatıldı; aşağıdaki 'Devam eden işler' bölümünden takip edebilirsin.")
         else:
-            _mb = st.session_state.get("master_upload_bytes")
-            _mn = st.session_state.get("master_upload_name") or "master.png"
-            master_temp_path = _save_bytes_to_temp(
-                _mb, Path(_mn).suffix or ".png"
+            new_run = storage.create_run(
+                owner=profile["slug"],
+                mode=run_mode,
+                master_prompt=master_prompt.strip(),
+                variations=variations_list,
+                use_auto_prefix=bool(use_auto_prefix),
+                max_workers=int(max_workers),
+                output_base=output_dir,
+                master_bytes=master_path.read_bytes(),
+                master_name=profile["master"]["name"],
+                key_fp=key_fingerprint(api_key),
+                fingerprint=fingerprint,
+                host=HOSTNAME,
+                process_token=PROCESS_TOKEN,
+            )
+            manager.start_run(new_run, api_key)
+            st.toast(
+                f"{MODE_LABELS[run_mode]} iş başlatıldı ({len(variations_list)} varyasyon).",
+                icon="🚀",
+            )
+            st.rerun()
+
+
+# ===========================================================================
+#                         DEVAM EDEN İŞLER (canlı panel)
+# ===========================================================================
+def _render_cancel_control(run: dict) -> None:
+    if run.get("cancel_requested"):
+        st.caption("İptal ediliyor…")
+        return
+    confirm_key = f"confirm_cancel_{run['id']}"
+    if not st.session_state.get(confirm_key):
+        if st.button("⏹️ İptal", key=f"cancel_{run['id']}", width="stretch"):
+            st.session_state[confirm_key] = True
+            st.rerun(scope="fragment")
+        return
+    st.caption("Emin misin?")
+    yes_col, no_col = st.columns(2)
+    if yes_col.button("Evet", key=f"cancel_yes_{run['id']}", type="primary", width="stretch"):
+        st.session_state.pop(confirm_key, None)
+        try:
+            manager.cancel_run(run["id"])
+        except Exception as exc:
+            st.error(f"İptal edilemedi: {exc}")
+        else:
+            st.toast("İptal isteği gönderildi.", icon="⏹️")
+            st.rerun(scope="fragment")
+    if no_col.button("Hayır", key=f"cancel_no_{run['id']}", width="stretch"):
+        st.session_state.pop(confirm_key, None)
+        st.rerun(scope="fragment")
+
+
+def _render_active_run(run: dict) -> None:
+    items = run["items"]
+    total = len(items)
+    ok_count = sum(1 for i in items if i["status"] == "ok")
+    failed = [i for i in items if i["status"] == "failed"]
+    finished_count = sum(1 for i in items if i["status"] != "pending")
+
+    with st.container(border=True):
+        info_col, action_col = st.columns([5, 1])
+        info_col.markdown(
+            f"**{MODE_LABELS[run['mode']]}** · {_fmt_time(run['created_at'])} · "
+            f"{total} varyasyon — {STATUS_LABELS.get(run['status'], run['status'])}"
+        )
+        with action_col:
+            _render_cancel_control(run)
+
+        if run["mode"] == "standard":
+            st.progress(
+                finished_count / total if total else 0.0,
+                text=f"{finished_count}/{total} tamamlandı · ✅ {ok_count} · ❌ {len(failed)}",
+            )
+            for item in failed[-3:]:
+                st.caption(f"❌ {item['key']} {item['variation'][:40]}: {item['error']}")
+            return
+
+        batch = run.get("batch") or {}
+        if run["status"] in ("queued", "submitting") or not batch.get("job_name"):
+            st.info("📤 Referans görsel ve istekler Google'a yükleniyor…")
+            return
+        elapsed = time.time() - (batch.get("submitted_at") or run["created_at"])
+        state = batch.get("state") or ""
+        st.info(
+            f"🕒 Google'da: **{BATCH_STATE_LABELS.get(state, state or '?')}** · "
+            f"gönderileli {_fmt_duration(elapsed)} · son kontrol {_fmt_ago(batch.get('last_checked_at'))}"
+        )
+        st.caption(
+            "Batch işleri genelde dakikalar-saatler sürer (en fazla 24 saat). "
+            "Sayfayı kapatabilirsin: sonuç hazır olunca otomatik indirilir ve "
+            "aşağıdaki listede görünür."
+        )
+        if batch.get("last_error"):
+            st.warning(batch["last_error"])
+
+
+@st.fragment(run_every=LIVE_REFRESH_SECONDS)
+def _live_runs_panel(owner: str) -> None:
+    active = [
+        r for r in storage.list_runs(owner=owner)
+        if r["status"] in storage.ACTIVE_STATUSES and not r.get("hidden")
+    ]
+    if not active:
+        # Son aktif iş de bitti: tüm sayfayı yenile ki sonuç aşağıda görünsün
+        # ve bu periyodik yenileme dursun.
+        st.rerun()
+    st.subheader(f"⏳ Devam eden işler ({len(active)})")
+    st.caption(
+        "İşler arka planda çalışır: sayfayı yenileyebilir, başka şeylere basabilir "
+        "hatta sekmeyi kapatabilirsin."
+    )
+    for run in active:
+        _render_active_run(run)
+
+
+profile_runs = [r for r in storage.list_runs(owner=profile["slug"]) if not r.get("hidden")]
+if any(r["status"] in storage.ACTIVE_STATUSES for r in profile_runs):
+    _live_runs_panel(profile["slug"])
+
+
+# ===========================================================================
+#                             TAMAMLANAN İŞLER
+# ===========================================================================
+def _render_image_grid(run: dict, images: list[tuple[dict, Path]]) -> None:
+    cols_per_row = 4
+    for row_start in range(0, len(images), cols_per_row):
+        cols = st.columns(cols_per_row)
+        for col, (item, path) in zip(cols, images[row_start : row_start + cols_per_row]):
+            with col:
+                st.image(str(path), caption=item["variation"][:60] or path.name, width="stretch")
+                suffix = path.suffix.lstrip(".").lower()
+                st.download_button(
+                    label="💾 İndir",
+                    # Callable: dosya sadece tıklanınca okunur; on_click="ignore":
+                    # indirme sayfayı yeniden çalıştırmaz.
+                    data=functools.partial(path.read_bytes),
+                    file_name=path.name,
+                    mime=f"image/{'jpeg' if suffix == 'jpg' else suffix}",
+                    key=f"dl_{run['id']}_{item['key']}",
+                    on_click="ignore",
+                    width="stretch",
+                )
+
+
+def _render_finished_run(run: dict, show_images_default: bool) -> None:
+    items = run["items"]
+    out_dir = Path(run["output_dir"])
+    images = [
+        (item, out_dir / item["file"])
+        for item in items
+        if item["status"] == "ok" and item.get("file") and (out_dir / item["file"]).exists()
+    ]
+    ok_count = sum(1 for i in items if i["status"] == "ok")
+    unfinished = [i for i in items if i["status"] in ("failed", "cancelled")]
+    failed = [i for i in items if i["status"] == "failed"]
+    price = PRICE_PER_IMAGE_BATCH if run["mode"] == "batch" else PRICE_PER_IMAGE_STANDARD
+
+    title = (
+        f"{STATUS_LABELS.get(run['status'], run['status'])} · {MODE_LABELS[run['mode']]} · "
+        f"{_fmt_time(run['created_at'])} · {ok_count}/{len(items)} görsel · ~${ok_count * price:.2f}"
+    )
+    if run.get("imported"):
+        title += " · hesaptan içe aktarıldı"
+
+    with st.expander(title, expanded=show_images_default):
+        if run.get("error"):
+            st.error(run["error"])
+        if run.get("master_prompt"):
+            st.caption(f"Prompt: {run['master_prompt'][:200]}")
+        st.caption(f"📁 `{out_dir}`")
+
+        zip_col, toggle_col, hide_col = st.columns([3, 2, 2], vertical_alignment="center")
+        if images:
+            zip_col.download_button(
+                label=f"📦 Hepsini ZIP olarak indir ({len(images)} görsel)",
+                data=_zip_builder([path for _, path in images]),
+                file_name=f"gemini_{run['id']}.zip",
+                mime="application/zip",
+                key=f"zip_{run['id']}",
+                on_click="ignore",
+                width="stretch",
+            )
+        show_images = toggle_col.toggle(
+            "Görselleri göster", value=show_images_default, key=f"show_{run['id']}"
+        )
+        if hide_col.button("Listeden kaldır", key=f"hide_{run['id']}", help="Dosyalar diskte kalır.", width="stretch"):
+            storage.update_run(run["id"], lambda r: r.update(hidden=True))
+            st.rerun()
+
+        if show_images and images:
+            _render_image_grid(run, images)
+
+        if failed:
+            st.markdown(f"**❌ Başarısız varyasyonlar ({len(failed)})**")
+            for item in failed:
+                label = item["variation"] or item["key"]
+                st.markdown(f"- **{label}** — {item['error'] or 'sebep bilinmiyor'}")
+            if any(
+                "429" in (i["error"] or "") or "RESOURCE_EXHAUSTED" in (i["error"] or "").upper()
+                for i in failed
+            ):
+                st.info(
+                    "**Rate Limit / Quota (429)**: Eş zamanlı istek sayısını düşür ve bekle; "
+                    "günlük kota dolduysa yarın dene; free tier'da bu model çalışmaz → Billing aç."
+                )
+        retry_text = "\n".join(i["variation"] for i in unfinished if i["variation"])
+        if retry_text:
+            st.button(
+                f"↩️ Tamamlanmayan {len(unfinished)} varyasyonu forma aktar",
+                key=f"retry_{run['id']}",
+                on_click=_set_variations,
+                args=(retry_text,),
+                help="Varyasyon kutusunu bu satırlarla doldurur; yeniden başlatmak sana kalır.",
             )
 
-        try:
-            # Standart mod: st.status İÇİNDE grid güncellenirse kutu kapanınca içerik
-            # kayboluyor gibi davranır; indirme de tam rerun tetikler — grid ana akışta kalsın.
-            if api_mode == "batch":
-                with st.status(
-                    f"{mode_label} işlemi başlatılıyor...",
-                    expanded=True,
-                ) as status:
-                    saved_paths, failed_keys = _run_batch_flow(
-                        api_key=api_key_input,
-                        master_temp_path=master_temp_path,
-                        master_prompt=master_prompt,
-                        variations_list=variations_list,
-                        output_dir=output_dir,
-                        use_auto_prefix=use_auto_prefix,
-                    )
-                    st.session_state.saved_paths = [str(p) for p in saved_paths]
-                    st.session_state.failed_keys = failed_keys
-                    status.update(
-                        label=f"✅ {len(saved_paths)} görsel başarıyla üretildi!",
-                        state="complete",
-                        expanded=False,
-                    )
-            else:
-                saved_paths, failed_keys = _run_standard_flow(
-                    api_key=api_key_input,
-                    master_temp_path=master_temp_path,
-                    master_prompt=master_prompt,
-                    variations_list=variations_list,
-                    workers=max_workers or 2,
-                    output_dir=output_dir,
-                    use_auto_prefix=use_auto_prefix,
-                )
-                st.session_state.saved_paths = [str(p) for p in saved_paths]
-                st.session_state.failed_keys = failed_keys
-                st.success(
-                    f"✅ {len(saved_paths)} görsel hazır; aşağıdan indirebilirsin.",
-                    icon="✅",
-                )
 
-        except Exception as exc:
-            st.session_state.last_error = str(exc)
+st.divider()
+st.subheader("🖼️ Üretimler")
+finished_runs = [r for r in profile_runs if r["status"] in storage.FINISHED_STATUSES]
+if not finished_runs:
+    st.caption("Henüz tamamlanan iş yok. Başlattığın işler bitince burada listelenir.")
 
-            # 429 için özel kullanıcı dostu mesaj
-            if "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc).upper():
-                st.error(
-                    "❌ **Rate Limit / Quota Hatası (429)**\n\n"
-                    "- Çok hızlı istek attın → Worker sayısını düşür ve bekle\n"
-                    "- Günlük kotan doldu → Yarın tekrar dene\n"
-                    "- Free tier'da `gemini-2.5-flash-image` çalışmaz → Billing aç"
-                )
-            st.exception(exc)
-
-        finally:
-            st.session_state.is_running = False
-            try:
-                master_temp_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-
-
-# ===========================================================================
-#                         SONUÇ GRİDİ (tek çizim noktası)
-# ===========================================================================
-_draw_results_section()
-
-
-# ===========================================================================
-#                          KALICI HATA GÖSTERİMİ
-# ===========================================================================
-if st.session_state.last_error:
-    st.divider()
-    with st.expander("❌ Son hata detayı", expanded=False):
-        st.error(st.session_state.last_error)
+visible_count = st.session_state.get("_visible_runs", 10)
+for position, finished_run in enumerate(finished_runs[:visible_count]):
+    _render_finished_run(finished_run, show_images_default=position == 0)
+if len(finished_runs) > visible_count:
+    if st.button(f"Daha eski işleri göster ({len(finished_runs) - visible_count})"):
+        st.session_state["_visible_runs"] = visible_count + 10
+        st.rerun()

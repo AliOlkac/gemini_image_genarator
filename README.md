@@ -71,7 +71,9 @@ pip install -r requirements.txt
 
 ### 5) API anahtarını ayarlayın
 
-Proje kökünde **`.env`** dosyası oluşturun (Not Defteri yeterli):
+En kolayı: uygulamayı açın, sol menüdeki **🔑 API Anahtarı** alanına yapıştırıp **Kaydet**'e basın. Anahtar proje kökündeki **`.env`** dosyasına yazılır; sayfa yenilense veya uygulama yeniden başlasa da silinmez.
+
+İsterseniz `.env` dosyasını elle de oluşturabilirsiniz:
 
 ```env
 GEMINI_API_KEY=buraya_ai_studio_anahtariniz
@@ -87,7 +89,17 @@ GEMINI_API_KEY=buraya_ai_studio_anahtariniz
 streamlit run main.py
 ```
 
-Tarayıcıda genelde `http://localhost:8501` açılır.
+Tarayıcıda genelde `http://localhost:8501` açılır. Windows'ta `start.bat` dosyasına çift tıklamak da kurulumu kontrol edip uygulamayı başlatır.
+
+---
+
+## Nasıl çalışır?
+
+- **Kullanıcı seçimi:** Açılışta isminizi seçin ya da yeni kullanıcı oluşturun. Her kullanıcının formu, referans görseli ve üretimleri ayrı tutulur; aynı anda birden fazla kişi kullanabilir, görseller karışmaz.
+- **Arka planda üretim:** "Üretimi Başlat"a bastıktan sonra iş sunucuda arka planda çalışır. Sayfayı yenilemek, başka bir şeye basmak veya sekmeyi kapatmak işi durdurmaz; geri döndüğünüzde kaldığı yerden görürsünüz.
+- **Batch işleri:** Google'a gönderildiği anda kaydedilir ve 20 saniyede bir kontrol edilir. Bitince görseller **otomatik indirilir** (tarayıcı kapalı olsa bile, uygulama çalıştığı sürece). Uygulama kapanıp açılırsa takip kaldığı yerden sürer. İstediğiniz an **İptal** edebilirsiniz.
+- **Kurtarma:** Eski sürümde sayfa kapandığı için sonucu indirilmemiş batch işleri için sol menüdeki **🔎 Hesaptaki batch işlerini tara** butonunu kullanın.
+- **Başarısızlar:** Her varyasyonun hata sebebi listede görünür; "Tamamlanmayanları forma aktar" ile tekrar deneyebilirsiniz.
 
 ---
 
@@ -95,7 +107,8 @@ Tarayıcıda genelde `http://localhost:8501` açılır.
 
 | Yol | Açıklama |
 |-----|----------|
-| `outputs/` | Üretilen görseller (varsayılan çıktı; `.gitignore` ile repoda takip edilmez) |
+| `outputs/<kullanıcı>/<iş>/` | Üretilen görseller; her iş ayrı klasörde, dosya adları varyasyondan (`001_kirmizi-arka-plan.png`) |
+| `data/` | Kullanıcı formları ve iş kayıtları (yerel; commit edilmez) |
 | `.venv/` | Sanal ortam (yerel; commit edilmez) |
 
 ---
