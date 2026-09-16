@@ -5,11 +5,13 @@
 
 # Streamlit: Hızlı web arayüzü kurmak için kullandığımız framework.
 # Sadece Python ile reaktif UI yazmamızı sağlıyor.
-streamlit>=1.30.0
+# (st.fragment(run_every), ertelenmiş download_button verisi ve width="stretch"
+#  kullanıldığı için yeni sürüm gerekiyor.)
+streamlit>=1.61.0
 
 # google-genai: Google'ın YENİ resmi Gen AI SDK'sı (deprecated google-generativeai
 # yerine geçer). Batch API ve gemini-2.5-flash-image desteği bu kütüphanede.
-google-genai>=0.3.0
+google-genai>=2.17.0
 
 # python-dotenv: .env dosyasından API_KEY gibi ortam değişkenlerini okumak için.
 python-dotenv>=1.0.0
