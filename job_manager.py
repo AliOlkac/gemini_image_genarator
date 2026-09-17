@@ -96,6 +96,13 @@ def _finalize_status(run: dict) -> None:
         run["status"] = "failed"
     run["finished_at"] = time.time()
 
+    # Prompt ve varyasyon listesi görsellerin yanında da dursun: klasöre
+    # _bilgi.txt yazılır (haftalar sonra "bu hangi prompt'tu?" sorusu için).
+    try:
+        storage.write_run_info(run)
+    except OSError:
+        _LOGGER.warning("Bilgi dosyası yazılamadı: %s", run.get("id"))
+
 
 def _save_payload(run: dict, item: dict, payload: ImagePayload) -> str:
     """Görseli işin klasörüne yazar, dosya adını döndürür."""
