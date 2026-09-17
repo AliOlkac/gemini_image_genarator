@@ -66,7 +66,7 @@ Prompt’un başında `(.venv)` görünmeli.
 
 ```powershell
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 ### 5) API anahtarını ayarlayın
@@ -86,8 +86,10 @@ GEMINI_API_KEY=buraya_ai_studio_anahtariniz
 
 ```powershell
 # Sanal ortam açıkken (.venv)
-streamlit run main.py
+python -m streamlit run main.py
 ```
+
+> Not: Bazı Windows kurulumlarında **Uygulama Denetimi (App Control)** ilkesi `.venv\Scripts` içindeki `pip.exe` / `streamlit.exe` kısayollarını engeller. Bu yüzden komutlar `python -m ...` biçiminde yazıldı; `start.bat` de aynı yolu kullanır.
 
 Tarayıcıda genelde `http://localhost:8501` açılır. Windows'ta `start.bat` dosyasına çift tıklamak da kurulumu kontrol edip uygulamayı başlatır.
 
@@ -117,7 +119,8 @@ Tarayıcıda genelde `http://localhost:8501` açılır. Windows'ta `start.bat` d
 
 | Sorun | Ne yapmalı |
 |-------|------------|
-| `streamlit` tanınmıyor | `Activate.ps1` ile venv açık mı kontrol edin; `pip install -r requirements.txt` tekrar. |
+| `streamlit` tanınmıyor | `Activate.ps1` ile venv açık mı kontrol edin; `python -m pip install -r requirements.txt` tekrar. |
+| `Uygulama Denetimi ilkesi bu dosyayı engelledi` | Windows, venv içindeki `pip.exe` / `streamlit.exe` kısayollarını engelliyor. Komutları `.\.venv\Scripts\python.exe -m pip ...` ve `.\.venv\Scripts\python.exe -m streamlit run main.py` şeklinde çalıştırın. |
 | `429 RESOURCE_EXHAUSTED` | Ücretsiz kota / dakikalık limit; AI Studio’da plan ve limitlere bakın; eşzamanlı istek sayısını düşürün. |
 | API key hatası | `.env` dosyası proje kökünde mi, değişken adı tam `GEMINI_API_KEY` mi; Streamlit’i yeniden başlatın. |
 
