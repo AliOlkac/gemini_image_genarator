@@ -57,7 +57,6 @@ if (-not $pythonCmd) {
 # ---------------------------------------------------------------------------
 $venvPath = Join-Path $ProjectRoot ".venv"
 $venvPython = Join-Path $venvPath "Scripts\python.exe"
-$venvPip = Join-Path $venvPath "Scripts\pip.exe"
 
 if (-not (Test-Path $venvPython)) {
     Write-Host "[...] Sanal ortam (.venv) olusturuluyor..." -ForegroundColor Yellow
@@ -77,11 +76,11 @@ else {
 # ---------------------------------------------------------------------------
 Write-Host "[...] Bagimliliklar kontrol ediliyor..." -ForegroundColor Yellow
 & $venvPython -m pip install --upgrade pip --quiet
-& $venvPip install -r (Join-Path $ProjectRoot "requirements.txt") --quiet
+& $venvPython -m pip install -r (Join-Path $ProjectRoot "requirements.txt") --quiet
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "[HATA] pip install basarisiz. Asagidaki komutu elle calistir:" -ForegroundColor Red
-    Write-Host "       .\.venv\Scripts\pip install -r requirements.txt" -ForegroundColor Yellow
+    Write-Host "       .\.venv\Scripts\python.exe -m pip install -r requirements.txt" -ForegroundColor Yellow
     exit 1
 }
 Write-Host "[OK] Bagimliliklar yuklu." -ForegroundColor Green
@@ -119,5 +118,4 @@ Write-Host "Streamlit aciliyor -> http://localhost:8501" -ForegroundColor Cyan
 Write-Host "Durdurmak icin: Ctrl+C" -ForegroundColor DarkGray
 Write-Host ""
 
-$streamlitExe = Join-Path $venvPath "Scripts\streamlit.exe"
-& $streamlitExe run (Join-Path $ProjectRoot "main.py")
+& $venvPython -m streamlit run (Join-Path $ProjectRoot "main.py")
