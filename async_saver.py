@@ -17,6 +17,7 @@ döndürmüyor (görsel inline base64 geliyor). Bu yüzden aiohttp yerine
 aiofiles kullanmak doğru mühendislik tercihi.
 """
 
+
 from __future__ import annotations
 
 import asyncio
