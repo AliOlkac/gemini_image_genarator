@@ -75,6 +75,12 @@ STATUS_LABELS = {
     "cancelled": "⏹️ İptal edildi",
     "interrupted": "⚠️ Yarıda kaldı",
 }
+ITEM_STATUS_LABELS = {
+    "ok": "✅ üretildi",
+    "failed": "❌ başarısız",
+    "cancelled": "⏹️ iptal",
+    "pending": "⏳ beklemede",
+}
 BATCH_STATE_LABELS = {
     "JOB_STATE_QUEUED": "kuyrukta bekliyor",
     "JOB_STATE_PENDING": "kuyrukta bekliyor",
@@ -170,6 +176,26 @@ def _set_variations(text: str) -> None:
     st.session_state["widget_variations"] = text
 
 
+def _load_run_into_form(run: dict) -> None:
+    """Eski bir işin prompt'unu, varyasyonlarını ve referans görselini forma geri yükler."""
+    st.session_state["widget_master_prompt"] = run.get("master_prompt") or ""
+    variations = [i["variation"] for i in run.get("items", []) if i.get("variation")]
+    if variations:
+        st.session_state["widget_variations"] = "\n".join(variations)
+    st.session_state["widget_auto_prefix"] = bool(run.get("use_auto_prefix", True))
+
+    # Referans görselin kopyası iş klasöründe duruyor; profildeki görseli onunla değiştir.
+    master_file = run.get("master_file")
+    if master_file:
+        master_path = Path(run["output_dir"]) / master_file
+        if master_path.exists():
+            storage.save_profile_master(
+                run["owner"], master_path.read_bytes(), f"referans{master_path.suffix}"
+            )
+            st.session_state["_uploader_nonce"] = st.session_state.get("_uploader_nonce", 0) + 1
+    st.session_state["_form_loaded_from_run"] = True
+
+
 def _remove_master_callback(slug: str) -> None:
     storage.clear_profile_master(slug)
     # Uploader'ın key'i değişir → içindeki eski dosya da temizlenir.
@@ -216,6 +242,9 @@ if profile is None:
 
 _load_form_into_session(profile)
 api_key = get_api_key()
+
+if st.session_state.pop("_form_loaded_from_run", False):
+    st.toast("Eski işin prompt'u, varyasyonları ve referans görseli forma yüklendi.", icon="↩️")
 
 
 # ===========================================================================
@@ -711,18 +740,66 @@ def _render_finished_run(run: dict, show_images_default: bool) -> None:
     if run.get("imported"):
         title += " · hesaptan içe aktarıldı"
 
+    # Prompt + varyasyon listesi görsellerin yanında da dursun (eski işlerde eksikse yaz).
+    info_path = out_dir / storage.RUN_INFO_FILENAME
+    if out_dir.exists() and not info_path.exists():
+        try:
+            storage.write_run_info(run)
+        except OSError:
+            pass
+
     with st.expander(title, expanded=show_images_default):
         if run.get("error"):
             st.error(run["error"])
-        if run.get("master_prompt"):
-            st.caption(f"Prompt: {run['master_prompt'][:200]}")
         st.caption(f"📁 `{out_dir}`")
+
+        # Bu üretim neyle yapılmıştı? Prompt ve varyasyonlar burada.
+        with st.container(border=True):
+            st.markdown("**📝 Master prompt**")
+            st.code(
+                run.get("master_prompt") or "(bu iş için prompt kaydı yok)",
+                language=None,
+                wrap_lines=True,
+            )
+
+            if items:
+                st.markdown(f"**🔀 Varyasyonlar ({len(items)})**")
+                st.dataframe(
+                    [
+                        {
+                            "#": item["index"],
+                            "Varyasyon": item["variation"] or "(metin yok)",
+                            "Durum": ITEM_STATUS_LABELS.get(item["status"], item["status"]),
+                            "Dosya / sebep": item.get("file") or item.get("error") or "",
+                        }
+                        for item in items
+                    ],
+                    hide_index=True,
+                    width="stretch",
+                )
+                variation_text = "\n".join(i["variation"] for i in items if i["variation"])
+                if variation_text:
+                    st.caption("Varyasyon listesini kopyalamak için:")
+                    st.code(variation_text, language=None)
+
+            st.button(
+                "↩️ Bu işi forma yükle",
+                key=f"reuse_{run['id']}",
+                on_click=_load_run_into_form,
+                args=(run,),
+                help=(
+                    "Prompt'u, varyasyonları ve bu işte kullanılan referans görseli "
+                    "forma geri yükler. Üretimi sen başlatırsın."
+                ),
+            )
 
         zip_col, toggle_col, hide_col = st.columns([3, 2, 2], vertical_alignment="center")
         if images:
             zip_col.download_button(
                 label=f"📦 Hepsini ZIP olarak indir ({len(images)} görsel)",
-                data=_zip_builder([path for _, path in images]),
+                data=_zip_builder(
+                    [path for _, path in images] + ([info_path] if info_path.exists() else [])
+                ),
                 file_name=f"gemini_{run['id']}.zip",
                 mime="application/zip",
                 key=f"zip_{run['id']}",
@@ -740,10 +817,7 @@ def _render_finished_run(run: dict, show_images_default: bool) -> None:
             _render_image_grid(run, images)
 
         if failed:
-            st.markdown(f"**❌ Başarısız varyasyonlar ({len(failed)})**")
-            for item in failed:
-                label = item["variation"] or item["key"]
-                st.markdown(f"- **{label}** — {item['error'] or 'sebep bilinmiyor'}")
+            # Sebepler yukarıdaki tabloda; burada sadece sık karşılaşılan uyarı.
             if any(
                 "429" in (i["error"] or "") or "RESOURCE_EXHAUSTED" in (i["error"] or "").upper()
                 for i in failed

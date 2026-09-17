@@ -34,6 +34,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -439,3 +440,83 @@ def create_imported_run(
     }
     save_run(run)
     return run
+# ===========================================================================
+#                    İŞ KLASÖRÜNE YAZILAN BİLGİ DOSYASI
+# ===========================================================================
+# Görseller haftalar sonra Dosya Gezgini'nden açıldığında "bu hangi prompt'tu?"
+# sorusunun cevabı klasörün içinde dursun diye.
+_RUN_STATUS_TR = {
+    "done": "Tamamlandı",
+    "partial": "Kısmen tamamlandı",
+    "failed": "Başarısız",
+    "cancelled": "İptal edildi",
+    "interrupted": "Yarıda kaldı",
+    "queued": "Sırada",
+    "running": "Üretiliyor",
+    "submitting": "Gönderiliyor",
+    "waiting": "Google'da işleniyor",
+    "downloading": "İndiriliyor",
+}
+_ITEM_STATUS_TR = {
+    "ok": "üretildi",
+    "failed": "başarısız",
+    "cancelled": "iptal",
+    "pending": "beklemede",
+}
+RUN_INFO_FILENAME = "_bilgi.txt"
+
+
+def run_info_text(run: dict) -> str:
+    """İşin prompt'unu, ayarlarını ve varyasyon-dosya eşleşmesini metne döker."""
+    items = run.get("items") or []
+    ok_count = sum(1 for item in items if item["status"] == "ok")
+    created = run.get("created_at")
+    created_str = datetime.fromtimestamp(created).strftime("%d.%m.%Y %H:%M") if created else "?"
+    mode = "Batch" if run.get("mode") == "batch" else "Standart"
+    status = _RUN_STATUS_TR.get(run.get("status"), run.get("status", "?"))
+
+    lines = [
+        "Gemini 2.5 Flash Image Batcher — üretim bilgisi",
+        "=" * 50,
+        f"Kullanıcı      : {run.get('owner', '?')}",
+        f"Tarih          : {created_str}",
+        f"Mod            : {mode}",
+        f"Durum          : {status} ({ok_count}/{len(items)} görsel)",
+        f"Otomatik önek  : {'açık' if run.get('use_auto_prefix') else 'kapalı'}",
+        f"İş kimliği     : {run.get('id', '?')}",
+        "",
+        "MASTER PROMPT",
+        "-" * 50,
+        (run.get("master_prompt") or "(bu iş için prompt kaydı yok)").strip(),
+        "",
+        f"VARYASYONLAR ({len(items)})",
+        "-" * 50,
+    ]
+
+    if not items:
+        lines.append("(varyasyon kaydı yok — hesaptan içe aktarılmış iş)")
+    for item in items:
+        durum = _ITEM_STATUS_TR.get(item["status"], item["status"])
+        lines.append(f"{item['index']:03d} [{durum}] {item['variation'] or '(varyasyon metni yok)'}")
+        if item.get("file"):
+            lines.append(f"     -> {item['file']}")
+        elif item.get("error"):
+            lines.append(f"     -> {item['error']}")
+
+    if run.get("error"):
+        lines += ["", "NOT", "-" * 50, run["error"]]
+
+    return "\n".join(lines) + "\n"
+
+
+def write_run_info(run: dict) -> Path | None:
+    """Bilgi dosyasını işin çıktı klasörüne yazar. Klasör yoksa atlar."""
+    output_dir = run.get("output_dir")
+    if not output_dir:
+        return None
+    folder = Path(output_dir)
+    if not folder.exists():
+        return None
+    info_path = folder / RUN_INFO_FILENAME
+    _atomic_write_bytes(info_path, run_info_text(run).encode("utf-8-sig"))
+    return info_path
