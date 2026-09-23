@@ -208,6 +208,38 @@ def _load_run_into_form(run: dict) -> None:
     st.session_state["_form_loaded_from_run"] = True
 
 
+def _toggle_select_all(run_ids: tuple[str, ...]) -> None:
+    """'Tümünü seç' kutusu: callback script'ten önce çalıştığı için kutuları değiştirebilir."""
+    value = bool(st.session_state.get("select_all_runs"))
+    for run_id in run_ids:
+        st.session_state[f"select_{run_id}"] = value
+
+
+def _set_flag(key: str, value: bool) -> None:
+    """Onay adımlarını açıp kapatır. Callback olarak kullanılır: script'ten önce
+    çalıştığı için st.rerun() gerekmez (rerun, henüz çizilmemiş seçim kutularının
+    durumunu silerdi)."""
+    if value:
+        st.session_state[key] = True
+    else:
+        st.session_state.pop(key, None)
+
+
+def _delete_runs(run_ids: list[str]) -> None:
+    """Seçilen işleri kayıt + klasör olarak siler, seçim kutularını temizler."""
+    deleted = 0
+    for run_id in run_ids:
+        if storage.delete_run(run_id):
+            deleted += 1
+        st.session_state.pop(f"select_{run_id}", None)
+        st.session_state.pop(f"confirm_delete_{run_id}", None)
+    st.session_state["select_all_runs"] = False
+    st.session_state.pop("_confirm_bulk_delete", None)
+    st.session_state["_delete_notice"] = (
+        f"{deleted} üretim ve klasörü silindi." if deleted else "Silinecek kayıt bulunamadı."
+    )
+
+
 def _remove_master_callback(slug: str) -> None:
     storage.clear_profile_master(slug)
     # Uploader'ın key'i değişir → içindeki eski dosya da temizlenir.
@@ -822,28 +854,35 @@ def _render_finished_run(run: dict, show_images_default: bool, size_bytes: int) 
             "Görselleri göster", value=show_images_default, key=f"show_{run['id']}"
         )
         confirm_key = f"confirm_delete_{run['id']}"
-        if delete_col.button(
+        delete_col.button(
             "🗑️ Sil",
             key=f"delete_{run['id']}",
             width="stretch",
             help="Bu üretimi ve klasöründeki görselleri kalıcı olarak siler.",
-        ):
-            st.session_state[confirm_key] = True
-            st.rerun()
+            on_click=_set_flag,
+            args=(confirm_key, True),
+        )
         if st.session_state.get(confirm_key):
             st.warning(
-                f"**{storage.run_label(run)}** silinecek: {len(images)} görsel, {size_text}. "
-                "Dosyalar diskten kalkar ve geri alınamaz."
+                f"**{storage.run_label(run)}** silinecek: {len(images)} görsel, {size_text}.\n\n"
+                f"`{out_dir}` klasörü bilgisayardan da kaldırılır; geri alınamaz."
             )
             yes_col, no_col = st.columns(2)
-            if yes_col.button("Evet, sil", key=f"delete_yes_{run['id']}", type="primary", width="stretch"):
-                st.session_state.pop(confirm_key, None)
-                storage.delete_run(run["id"])
-                st.toast("Üretim silindi.", icon="🗑️")
-                st.rerun()
-            if no_col.button("Vazgeç", key=f"delete_no_{run['id']}", width="stretch"):
-                st.session_state.pop(confirm_key, None)
-                st.rerun()
+            yes_col.button(
+                "Evet, sil",
+                key=f"delete_yes_{run['id']}",
+                type="primary",
+                width="stretch",
+                on_click=_delete_runs,
+                args=([run["id"]],),
+            )
+            no_col.button(
+                "Vazgeç",
+                key=f"delete_no_{run['id']}",
+                width="stretch",
+                on_click=_set_flag,
+                args=(confirm_key, False),
+            )
 
         if show_images and images:
             _render_image_grid(run, images)
@@ -879,13 +918,73 @@ else:
     st.subheader("🖼️ Üretimler")
     st.caption("Henüz tamamlanan iş yok. Başlattığın işler bitince burada listelenir.")
 
+delete_notice = st.session_state.pop("_delete_notice", None)
+if delete_notice:
+    st.toast(delete_notice, icon="🗑️")
+
 visible_count = st.session_state.get("_visible_runs", 10)
-for position, finished_run in enumerate(finished_runs[:visible_count]):
-    _render_finished_run(
-        finished_run,
-        show_images_default=position == 0,
-        size_bytes=run_sizes[finished_run["id"]],
+visible_runs = finished_runs[:visible_count]
+selected_ids = [r["id"] for r in visible_runs if st.session_state.get(f"select_{r['id']}")]
+
+if visible_runs:
+    select_col, action_col = st.columns([1, 2], vertical_alignment="center")
+    select_col.checkbox(
+        "Tümünü seç",
+        key="select_all_runs",
+        on_change=_toggle_select_all,
+        args=(tuple(r["id"] for r in visible_runs),),
+        help="Listede görünen işlerin hepsini işaretler.",
     )
+    if selected_ids:
+        selected_size = sum(run_sizes.get(i, 0) for i in selected_ids)
+        action_col.button(
+            f"🗑️ Seçilenleri sil ({len(selected_ids)} iş · {_fmt_size(selected_size)})",
+            key="bulk_delete",
+            type="primary",
+            width="stretch",
+            on_click=_set_flag,
+            args=("_confirm_bulk_delete", True),
+        )
+
+    if st.session_state.get("_confirm_bulk_delete") and selected_ids:
+        names = [storage.run_label(r, 40) for r in visible_runs if r["id"] in selected_ids]
+        st.warning(
+            f"**{len(selected_ids)} üretim** silinecek "
+            f"({_fmt_size(sum(run_sizes.get(i, 0) for i in selected_ids))}):\n\n"
+            + "\n".join(f"- {name}" for name in names)
+            + "\n\nKlasörleri bilgisayardan da kaldırılır; geri alınamaz."
+        )
+        yes_col, no_col = st.columns(2)
+        yes_col.button(
+            "Evet, hepsini sil",
+            key="bulk_delete_yes",
+            type="primary",
+            width="stretch",
+            on_click=_delete_runs,
+            args=(list(selected_ids),),
+        )
+        no_col.button(
+            "Vazgeç",
+            key="bulk_delete_no",
+            width="stretch",
+            on_click=_set_flag,
+            args=("_confirm_bulk_delete", False),
+        )
+
+for position, finished_run in enumerate(visible_runs):
+    check_col, run_col = st.columns([0.05, 0.95], vertical_alignment="top")
+    check_col.checkbox(
+        "Seç",
+        key=f"select_{finished_run['id']}",
+        label_visibility="collapsed",
+        help="Toplu silmek için işaretle.",
+    )
+    with run_col:
+        _render_finished_run(
+            finished_run,
+            show_images_default=position == 0,
+            size_bytes=run_sizes[finished_run["id"]],
+        )
 if len(finished_runs) > visible_count:
     if st.button(f"Daha eski işleri göster ({len(finished_runs) - visible_count})"):
         st.session_state["_visible_runs"] = visible_count + 10
