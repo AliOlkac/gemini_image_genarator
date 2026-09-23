@@ -119,6 +119,18 @@ def _fmt_ago(ts: float | None) -> str:
     return f"{int(time.time() - ts)} sn önce" if ts else "henüz yok"
 
 
+def _fmt_size(num_bytes: int) -> str:
+    if num_bytes >= 1024 * 1024:
+        return f"{num_bytes / 1024 / 1024:.1f} MB".replace(".", ",")
+    if num_bytes >= 1024:
+        return f"{num_bytes / 1024:.0f} KB"
+    return f"{num_bytes} B"
+
+
+def _status_icon(status: str) -> str:
+    return STATUS_LABELS.get(status, "•").split(" ")[0]
+
+
 def _validate_inputs(has_master_image: bool, prompt: str, variations: list[str]) -> list[str]:
     """Form girdilerini doğrular, hata listesi döner."""
     errors: list[str] = []
@@ -638,7 +650,7 @@ def _render_active_run(run: dict) -> None:
     with st.container(border=True):
         info_col, action_col = st.columns([5, 1])
         info_col.markdown(
-            f"**{MODE_LABELS[run['mode']]}** · {_fmt_time(run['created_at'])} · "
+            f"**{storage.run_label(run)}** · {MODE_LABELS[run['mode']]} · {_fmt_time(run['created_at'])} · "
             f"{total} varyasyon — {STATUS_LABELS.get(run['status'], run['status'])}"
         )
         with action_col:
@@ -676,7 +688,7 @@ def _render_active_run(run: dict) -> None:
 def _live_runs_panel(owner: str) -> None:
     active = [
         r for r in storage.list_runs(owner=owner)
-        if r["status"] in storage.ACTIVE_STATUSES and not r.get("hidden")
+        if r["status"] in storage.ACTIVE_STATUSES
     ]
     if not active:
         # Son aktif iş de bitti: tüm sayfayı yenile ki sonuç aşağıda görünsün
@@ -691,7 +703,7 @@ def _live_runs_panel(owner: str) -> None:
         _render_active_run(run)
 
 
-profile_runs = [r for r in storage.list_runs(owner=profile["slug"]) if not r.get("hidden")]
+profile_runs = storage.list_runs(owner=profile["slug"])
 if any(r["status"] in storage.ACTIVE_STATUSES for r in profile_runs):
     _live_runs_panel(profile["slug"])
 
@@ -720,7 +732,7 @@ def _render_image_grid(run: dict, images: list[tuple[dict, Path]]) -> None:
                 )
 
 
-def _render_finished_run(run: dict, show_images_default: bool) -> None:
+def _render_finished_run(run: dict, show_images_default: bool, size_bytes: int) -> None:
     items = run["items"]
     out_dir = Path(run["output_dir"])
     images = [
@@ -733,12 +745,12 @@ def _render_finished_run(run: dict, show_images_default: bool) -> None:
     failed = [i for i in items if i["status"] == "failed"]
     price = PRICE_PER_IMAGE_BATCH if run["mode"] == "batch" else PRICE_PER_IMAGE_STANDARD
 
+    size_text = _fmt_size(size_bytes)
     title = (
-        f"{STATUS_LABELS.get(run['status'], run['status'])} · {MODE_LABELS[run['mode']]} · "
-        f"{_fmt_time(run['created_at'])} · {ok_count}/{len(items)} görsel · ~${ok_count * price:.2f}"
+        f"{_status_icon(run['status'])} {storage.run_label(run)} · {_fmt_time(run['created_at'])} · "
+        f"{MODE_LABELS[run['mode']]} · {ok_count}/{len(items)} görsel · {size_text} · "
+        f"~${ok_count * price:.2f}"
     )
-    if run.get("imported"):
-        title += " · hesaptan içe aktarıldı"
 
     # Prompt + varyasyon listesi görsellerin yanında da dursun (eski işlerde eksikse yaz).
     info_path = out_dir / storage.RUN_INFO_FILENAME
@@ -793,7 +805,7 @@ def _render_finished_run(run: dict, show_images_default: bool) -> None:
                 ),
             )
 
-        zip_col, toggle_col, hide_col = st.columns([3, 2, 2], vertical_alignment="center")
+        zip_col, toggle_col, delete_col = st.columns([3, 2, 2], vertical_alignment="center")
         if images:
             zip_col.download_button(
                 label=f"📦 Hepsini ZIP olarak indir ({len(images)} görsel)",
@@ -809,9 +821,29 @@ def _render_finished_run(run: dict, show_images_default: bool) -> None:
         show_images = toggle_col.toggle(
             "Görselleri göster", value=show_images_default, key=f"show_{run['id']}"
         )
-        if hide_col.button("Listeden kaldır", key=f"hide_{run['id']}", help="Dosyalar diskte kalır.", width="stretch"):
-            storage.update_run(run["id"], lambda r: r.update(hidden=True))
+        confirm_key = f"confirm_delete_{run['id']}"
+        if delete_col.button(
+            "🗑️ Sil",
+            key=f"delete_{run['id']}",
+            width="stretch",
+            help="Bu üretimi ve klasöründeki görselleri kalıcı olarak siler.",
+        ):
+            st.session_state[confirm_key] = True
             st.rerun()
+        if st.session_state.get(confirm_key):
+            st.warning(
+                f"**{storage.run_label(run)}** silinecek: {len(images)} görsel, {size_text}. "
+                "Dosyalar diskten kalkar ve geri alınamaz."
+            )
+            yes_col, no_col = st.columns(2)
+            if yes_col.button("Evet, sil", key=f"delete_yes_{run['id']}", type="primary", width="stretch"):
+                st.session_state.pop(confirm_key, None)
+                storage.delete_run(run["id"])
+                st.toast("Üretim silindi.", icon="🗑️")
+                st.rerun()
+            if no_col.button("Vazgeç", key=f"delete_no_{run['id']}", width="stretch"):
+                st.session_state.pop(confirm_key, None)
+                st.rerun()
 
         if show_images and images:
             _render_image_grid(run, images)
@@ -838,14 +870,22 @@ def _render_finished_run(run: dict, show_images_default: bool) -> None:
 
 
 st.divider()
-st.subheader("🖼️ Üretimler")
 finished_runs = [r for r in profile_runs if r["status"] in storage.FINISHED_STATUSES]
-if not finished_runs:
+run_sizes = {r["id"]: storage.run_folder_size(r) for r in finished_runs}
+total_size = sum(run_sizes.values())
+if finished_runs:
+    st.subheader(f"🖼️ Üretimler ({len(finished_runs)} iş · {_fmt_size(total_size)})")
+else:
+    st.subheader("🖼️ Üretimler")
     st.caption("Henüz tamamlanan iş yok. Başlattığın işler bitince burada listelenir.")
 
 visible_count = st.session_state.get("_visible_runs", 10)
 for position, finished_run in enumerate(finished_runs[:visible_count]):
-    _render_finished_run(finished_run, show_images_default=position == 0)
+    _render_finished_run(
+        finished_run,
+        show_images_default=position == 0,
+        size_bytes=run_sizes[finished_run["id"]],
+    )
 if len(finished_runs) > visible_count:
     if st.button(f"Daha eski işleri göster ({len(finished_runs) - visible_count})"):
         st.session_state["_visible_runs"] = visible_count + 10
