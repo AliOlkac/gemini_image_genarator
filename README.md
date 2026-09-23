@@ -101,6 +101,7 @@ Tarayıcıda genelde `http://localhost:8501` açılır. Windows'ta `start.bat` d
 - **Arka planda üretim:** "Üretimi Başlat"a bastıktan sonra iş sunucuda arka planda çalışır. Sayfayı yenilemek, başka bir şeye basmak veya sekmeyi kapatmak işi durdurmaz; geri döndüğünüzde kaldığı yerden görürsünüz.
 - **Batch işleri:** Google'a gönderildiği anda kaydedilir ve 20 saniyede bir kontrol edilir. Bitince görseller **otomatik indirilir** (tarayıcı kapalı olsa bile, uygulama çalıştığı sürece). Uygulama kapanıp açılırsa takip kaldığı yerden sürer. İstediğiniz an **İptal** edebilirsiniz.
 - **Kurtarma:** Eski sürümde sayfa kapandığı için sonucu indirilmemiş batch işleri için sol menüdeki **🔎 Hesaptaki batch işlerini tara** butonunu kullanın.
+- **Geçmiş üretimler:** Her iş, master prompt'un ilk virgüle kadarki kısmıyla isimlendirilir; yanında tarih, görsel sayısı ve kapladığı yer görünür. Açtığınızda prompt'un tamamını ve varyasyon tablosunu (durum + dosya adı) görürsünüz. **🗑️ Sil** ile bir üretimi görselleriyle birlikte kalıcı olarak kaldırabilirsiniz (onay sorulur).
 - **Başarısızlar:** Her varyasyonun hata sebebi listede görünür; "Tamamlanmayanları forma aktar" ile tekrar deneyebilirsiniz.
 
 ---

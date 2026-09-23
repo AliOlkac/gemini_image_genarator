@@ -30,6 +30,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import tempfile
 import threading
 import time
@@ -165,6 +166,17 @@ def image_filename(index: int, variation: str, mime_type: str) -> str:
     ext = _EXT_BY_MIME.get((mime_type or "").lower(), ".png")
     slug = slugify(variation, 40)
     return f"{index:03d}_{slug}{ext}" if slug else f"{index:03d}{ext}"
+
+
+def run_label(run: dict, max_len: int = 60) -> str:
+    """İşin listede görünecek adı: master prompt'un ilk virgüle kadarki kısmı."""
+    prompt = " ".join((run.get("master_prompt") or "").split())
+    name = prompt.split(",")[0].strip()
+    if len(name) > max_len:
+        name = name[:max_len].rstrip() + "…"
+    if name:
+        return name
+    return "Hesaptan içe aktarılan iş" if run.get("imported") else "(isimsiz üretim)"
 
 
 def write_image(folder: Path, filename: str, data: bytes) -> Path:
@@ -322,6 +334,42 @@ def list_runs(owner: str | None = None) -> list[dict]:
         runs.append(data)
     runs.sort(key=lambda r: r.get("created_at", 0), reverse=True)
     return runs
+
+
+def delete_run(run_id: str) -> bool:
+    """
+    İş kaydını ve o işe ait çıktı klasörünü KALICI olarak siler.
+
+    Güvenlik: yalnızca adı run_id olan klasör silinir. Kullanıcı çıktı klasörünü
+    değiştirmiş ya da kayıt bozulmuş olsa bile paylaşılan bir klasör silinemez.
+    """
+    with _WRITE_LOCK:
+        run = load_run(run_id)
+        if run is not None:
+            folder = Path(run.get("output_dir") or "")
+            if folder.name == run_id and folder.is_dir():
+                shutil.rmtree(folder, ignore_errors=True)
+        path = _run_path(run_id)
+        existed = path.exists()
+        path.unlink(missing_ok=True)
+        _READ_CACHE.pop(str(path), None)
+        return existed
+
+
+def run_folder_size(run: dict) -> int:
+    """İşin klasöründeki dosyaların toplam boyutu (bayt). Klasör yoksa 0."""
+    folder = Path(run.get("output_dir") or "")
+    if not folder.is_dir():
+        return 0
+    total = 0
+    with os.scandir(folder) as entries:
+        for entry in entries:
+            if entry.is_file():
+                try:
+                    total += entry.stat().st_size
+                except OSError:
+                    pass
+    return total
 
 
 def create_run(
