@@ -35,15 +35,13 @@ from typing import Callable, Iterator
 from google import genai
 from google.genai import types
 
+from app_config import HTTP_TIMEOUT_MS, MODEL_NAME, build_prompt, is_placeholder_key
 from async_saver import ImagePayload
 
 
 # ---------------------------------------------------------------------------
-# Sabitler / Konfigürasyon
+# Sabitler / Konfigürasyon (model adı ve prompt öneki app_config.py'de)
 # ---------------------------------------------------------------------------
-# Kullanacağımız model: image generation destekleyen 2.5 flash varyantı.
-MODEL_NAME = "gemini-2.5-flash-image"
-
 # Polling sırasında her sorgu arasındaki bekleme süresi (saniye).
 # Çok kısa olursa kotamızı boş yere yeriz, çok uzun olursa UI yavaş güncellenir.
 POLL_INTERVAL_SECONDS = 15
@@ -56,17 +54,19 @@ TERMINAL_STATES = {
     "JOB_STATE_EXPIRED",     # 24 saat içinde bitmedi
 }
 
-# OTOMATİK GÖRSEL-ÜRET PREFIX'İ:
-# Modelin "STOP-without-image" davranışını ~%80 azaltan imperatif komut cümlesi.
-# Standard mode'daki ile AYNI olmalı - tutarlılık için.
-# DİKKAT: standard_handler.py'daki IMAGE_GENERATION_PREFIX ile senkron tut!
-# (DRY ihlali değil; iki modül mimari olarak eşit seviyede - import etmek
-#  yerine kopya tutuyoruz. Refactor gerekirse ortak `prompts.py` açılabilir.)
-IMAGE_GENERATION_PREFIX = (
-    "Based on the provided reference image, generate a new image "
-    "that matches the description below.\n"
-    "Do not answer with text only — output must include the generated image.\n\n"
-)
+
+# ---------------------------------------------------------------------------
+# Sonuç dosyasındaki tek bir isteğin sonucu: görsel YA DA başarısızlık sebebi.
+# Eskiden görsel dönmeyen satırlar sessizce atlanıyordu; kullanıcı 10 varyasyondan
+# 3'ünün neden eksik olduğunu göremiyordu.
+# ---------------------------------------------------------------------------
+@dataclass
+class BatchItemResult:
+    """Batch sonuç satırı: payload ya da error dolu olur."""
+
+    key: str
+    payload: ImagePayload | None = None
+    error: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -102,17 +102,22 @@ class GeminiBatchHandler:
                      "YOUR_API_KEY_HERE" gibi placeholder ise hata fırlatır.
         """
         # Placeholder kontrolü: kullanıcı .env'i doldurmadıysa erkenden uyaralım
-        if not api_key or "YOUR_API_KEY" in api_key.upper():
+        if is_placeholder_key(api_key):
             raise ValueError(
                 "API anahtarı geçerli değil. .env dosyasındaki "
                 "GEMINI_API_KEY değerini kendi anahtarınla değiştir."
             )
 
         # google-genai Client'ı: tüm API çağrıları bunun üzerinden gider.
-        self.client = genai.Client(api_key=api_key)
+        # timeout: kopan bağlantı yüzünden yükleme/sorgu sonsuza kadar asılı kalmasın.
+        self.client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=HTTP_TIMEOUT_MS),
+        )
 
         # State değişkenleri (sınıf bazlı; her instance kendi job'unu takip eder)
         self.master_file_uri: str | None = None      # Yüklenen master görselin URI'si
+        self.master_file_name: str | None = None     # Files API ismi (silmek için)
         self.master_mime_type: str | None = None     # Master görselin MIME tipi
         self.jsonl_file_name: str | None = None      # Yüklenen JSONL'nin Files API ismi
         self.batch_job_name: str | None = None       # Aktif batch job'ın ismi
@@ -185,6 +190,7 @@ class GeminiBatchHandler:
 
         # State'i kaydet ki sonraki adımlar (JSONL üretimi) kullansın
         self.master_file_uri = uploaded.uri
+        self.master_file_name = uploaded.name
         self.master_mime_type = mime_type
 
         return uploaded.uri
@@ -237,17 +243,12 @@ class GeminiBatchHandler:
 
         output_path = Path(output_path)
 
-        # Auto-prefix ile prompt'un başına imperatif komut ekleyelim mi?
-        # Standard mode'daki ile AYNI mantık - sidebar checkbox bu değeri kontrol eder.
-        prefix = IMAGE_GENERATION_PREFIX if use_auto_prefix else ""
-
         # JSONL'i satır satır yazıyoruz (utf-8 emoji/Türkçe karakterler için şart)
         with output_path.open("w", encoding="utf-8") as f:
             for idx, variation in enumerate(cleaned_variations, start=1):
                 # [opsiyonel auto-prefix] + master_prompt + varyasyon
-                combined_prompt = (
-                    f"{prefix}{master_prompt.strip()}\n\nVaryasyon: {variation}"
-                )
+                # (Standard mode ile aynı fonksiyon - sidebar checkbox kontrol eder)
+                combined_prompt = build_prompt(master_prompt, variation, use_auto_prefix)
 
                 # Batch isteği için tek bir JSON nesnesi
                 request_obj = {
@@ -401,13 +402,14 @@ class GeminiBatchHandler:
     # -----------------------------------------------------------------------
     # ADIM 5: Sonuçları İndir ve Parse Et
     # -----------------------------------------------------------------------
-    def fetch_results(self) -> list[ImagePayload]:
+    def fetch_results(self) -> dict[str, BatchItemResult]:
         """
-        Batch tamamlandıktan sonra sonuç JSONL'ini indirir ve içindeki
-        base64 görselleri ImagePayload listesine çevirir.
+        Batch tamamlandıktan sonra sonuç JSONL'ini indirir ve her satırı
+        BatchItemResult'a çevirir.
 
         Returns:
-            Diske yazılmaya hazır ImagePayload nesnelerinin listesi.
+            key ("req-001") -> BatchItemResult. Görsel dönmeyen veya hata veren
+            istekler de sebebiyle birlikte döner.
         """
         if not self.batch_job_name:
             raise RuntimeError("Aktif bir batch job yok.")
@@ -423,71 +425,95 @@ class GeminiBatchHandler:
             )
 
         # Sonuç dosyasının ismi job.dest.file_name içinde
-        result_file_name = job.dest.file_name
+        if not job.dest or not job.dest.file_name:
+            raise RuntimeError("Job sonucu dosya olarak dönmedi (dest.file_name yok).")
 
         # Files API'den sonuç JSONL'ini binary olarak indir
-        result_bytes = self.client.files.download(file=result_file_name)
+        result_bytes = self.client.files.download(file=job.dest.file_name)
         # bytes -> str -> satır satır JSON parse
         result_text = result_bytes.decode("utf-8")
 
-        payloads: list[ImagePayload] = []
+        results: dict[str, BatchItemResult] = {}
 
-        # JSONL: her satır ayrı bir JSON. Boş satırları es geçiyoruz.
+        # JSONL: her satır ayrı bir JSON. Boş / bozuk satırları es geçiyoruz.
         for line in result_text.splitlines():
             if not line.strip():
                 continue
-
-            # Bir satırı JSON'a çevir
-            entry = json.loads(line)
-            key = entry.get("key", "unknown")
-
-            # Hatalı entry varsa atla (kısmi başarı tolerans)
-            response = entry.get("response")
-            if not response:
-                continue
-
-            # Yanıt yapısı: response.candidates[0].content.parts[]
-            # Bazı parts text, bazıları inline_data (görsel) olabilir.
-            # Sadece görsel olanları topluyoruz.
             try:
-                candidates = response["candidates"]
-                parts = candidates[0]["content"]["parts"]
-            except (KeyError, IndexError):
-                # Beklenmedik bir yapı: bu entry'yi atla
+                entry = json.loads(line)
+            except json.JSONDecodeError:
                 continue
+            key = str(entry.get("key", "unknown"))
+            results[key] = self._parse_result_entry(key, entry)
 
-            for part in parts:
-                inline = part.get("inline_data") or part.get("inlineData")
-                if not inline:
-                    continue  # text part - bizi ilgilendirmiyor
+        return results
 
-                # Base64 görsel verisi ve MIME bilgisi
+    @staticmethod
+    def _parse_result_entry(key: str, entry: dict) -> BatchItemResult:
+        """Tek sonuç satırından ilk görseli çıkarır; yoksa sebebini açıklar."""
+        response = entry.get("response")
+        if not response:
+            error = entry.get("error") or entry.get("status") or {}
+            message = error.get("message") if isinstance(error, dict) else str(error)
+            return BatchItemResult(key=key, error=f"İstek başarısız: {message or 'detay yok'}")
+
+        candidates = response.get("candidates") or []
+        for candidate in candidates:
+            for part in (candidate.get("content") or {}).get("parts") or []:
                 # API hem snake_case hem camelCase kullanabiliyor (defansif okuma)
-                b64_data = inline.get("data")
-                mime = inline.get("mime_type") or inline.get("mimeType") or "image/png"
-
-                if b64_data:
-                    payloads.append(
-                        ImagePayload(
+                inline = part.get("inline_data") or part.get("inlineData")
+                if inline and inline.get("data"):
+                    mime = inline.get("mime_type") or inline.get("mimeType") or "image/png"
+                    return BatchItemResult(
+                        key=key,
+                        payload=ImagePayload(
                             key=key,
-                            base64_data=b64_data,
+                            base64_data=inline["data"],
                             mime_type=mime,
-                        )
+                        ),
                     )
 
-        return payloads
+        # Görsel yok → standart moddaki ile aynı teşhis sırası
+        feedback = response.get("prompt_feedback") or response.get("promptFeedback") or {}
+        block_reason = feedback.get("block_reason") or feedback.get("blockReason")
+        if block_reason:
+            return BatchItemResult(
+                key=key,
+                error=f"Prompt safety ile bloklandı: {block_reason}. Prompt'u yumuşat.",
+            )
+
+        reasons = [c.get("finish_reason") or c.get("finishReason") for c in candidates]
+        reasons_str = ", ".join(str(r) for r in reasons if r) or "?"
+        if "SAFETY" in reasons_str:
+            message = f"Safety filter görseli blokladı (finish_reason: {reasons_str})."
+        elif "RECITATION" in reasons_str:
+            message = "Model telif hakkı endişesiyle üretmedi (RECITATION)."
+        elif "MAX_TOKENS" in reasons_str:
+            message = "Token limiti dolduğu için görsel oluşmadı (MAX_TOKENS)."
+        else:
+            message = f"Model görsel dönmedi (finish_reason: {reasons_str})."
+        return BatchItemResult(key=key, error=message)
+
+    # -----------------------------------------------------------------------
+    # İptal
+    # -----------------------------------------------------------------------
+    def cancel(self) -> None:
+        """Job'ı Google tarafında iptal eder (henüz işlenmemiş istekler üretilmez)."""
+        if not self.batch_job_name:
+            raise RuntimeError("Aktif bir batch job yok.")
+        self.client.batches.cancel(name=self.batch_job_name)
 
     # -----------------------------------------------------------------------
     # YARDIMCI: Temizlik (opsiyonel - Files API'deki dosyaları sil)
     # -----------------------------------------------------------------------
     def cleanup(self) -> None:
         """
-        Files API'ye yüklenen geçici dosyaları siler.
+        Files API'ye yüklenen geçici dosyaları (JSONL + master görsel) siler.
         Files API kotası dolmasın diye çağırmak iyi pratik.
         """
         # try/except ile hatalar yutuluyor; cleanup başarısız olsa bile
         # ana akış zaten bitti, kullanıcıya hata göstermek anlamsız.
-        for file_ref in (self.jsonl_file_name,):
+        for file_ref in (self.jsonl_file_name, self.master_file_name):
             if file_ref:
                 try:
                     self.client.files.delete(name=file_ref)

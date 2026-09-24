@@ -66,12 +66,14 @@ Prompt’un başında `(.venv)` görünmeli.
 
 ```powershell
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 ### 5) API anahtarını ayarlayın
 
-Proje kökünde **`.env`** dosyası oluşturun (Not Defteri yeterli):
+En kolayı: uygulamayı açın, sol menüdeki **🔑 API Anahtarı** alanına yapıştırıp **Kaydet**'e basın. Anahtar proje kökündeki **`.env`** dosyasına yazılır; sayfa yenilense veya uygulama yeniden başlasa da silinmez.
+
+İsterseniz `.env` dosyasını elle de oluşturabilirsiniz:
 
 ```env
 GEMINI_API_KEY=buraya_ai_studio_anahtariniz
@@ -84,10 +86,23 @@ GEMINI_API_KEY=buraya_ai_studio_anahtariniz
 
 ```powershell
 # Sanal ortam açıkken (.venv)
-streamlit run main.py
+python -m streamlit run main.py
 ```
 
-Tarayıcıda genelde `http://localhost:8501` açılır.
+> Not: Bazı Windows kurulumlarında **Uygulama Denetimi (App Control)** ilkesi `.venv\Scripts` içindeki `pip.exe` / `streamlit.exe` kısayollarını engeller. Bu yüzden komutlar `python -m ...` biçiminde yazıldı; `start.bat` de aynı yolu kullanır.
+
+Tarayıcıda genelde `http://localhost:8501` açılır. Windows'ta `start.bat` dosyasına çift tıklamak da kurulumu kontrol edip uygulamayı başlatır.
+
+---
+
+## Nasıl çalışır?
+
+- **Kullanıcı seçimi:** Açılışta isminizi seçin ya da yeni kullanıcı oluşturun. Her kullanıcının formu, referans görseli ve üretimleri ayrı tutulur; aynı anda birden fazla kişi kullanabilir, görseller karışmaz.
+- **Arka planda üretim:** "Üretimi Başlat"a bastıktan sonra iş sunucuda arka planda çalışır. Sayfayı yenilemek, başka bir şeye basmak veya sekmeyi kapatmak işi durdurmaz; geri döndüğünüzde kaldığı yerden görürsünüz.
+- **Batch işleri:** Google'a gönderildiği anda kaydedilir ve 20 saniyede bir kontrol edilir. Bitince görseller **otomatik indirilir** (tarayıcı kapalı olsa bile, uygulama çalıştığı sürece). Uygulama kapanıp açılırsa takip kaldığı yerden sürer. İstediğiniz an **İptal** edebilirsiniz.
+- **Kurtarma:** Eski sürümde sayfa kapandığı için sonucu indirilmemiş batch işleri için sol menüdeki **🔎 Hesaptaki batch işlerini tara** butonunu kullanın.
+- **Geçmiş üretimler:** Her iş, master prompt'un ilk virgüle kadarki kısmıyla isimlendirilir; yanında tarih, görsel sayısı ve kapladığı yer görünür. Açtığınızda prompt'un tamamını ve varyasyon tablosunu (durum + dosya adı) görürsünüz. **🗑️ Sil** ile bir üretimi görselleriyle birlikte kalıcı olarak kaldırabilirsiniz. Her işin solundaki kutucukları (ya da **Tümünü seç**) işaretleyip birden fazla üretimi tek seferde de silebilirsiniz. Her iki durumda da önce ne silineceği gösterilir; onaylarsanız klasör bilgisayardan kaldırılır.
+- **Başarısızlar:** Her varyasyonun hata sebebi listede görünür; "Tamamlanmayanları forma aktar" ile tekrar deneyebilirsiniz.
 
 ---
 
@@ -95,7 +110,8 @@ Tarayıcıda genelde `http://localhost:8501` açılır.
 
 | Yol | Açıklama |
 |-----|----------|
-| `outputs/` | Üretilen görseller (varsayılan çıktı; `.gitignore` ile repoda takip edilmez) |
+| `outputs/<kullanıcı>/<iş>/` | Üretilen görseller; her iş ayrı klasörde, dosya adları varyasyondan (`001_kirmizi-arka-plan.png`) |
+| `data/` | Kullanıcı formları ve iş kayıtları (yerel; commit edilmez) |
 | `.venv/` | Sanal ortam (yerel; commit edilmez) |
 
 ---
@@ -104,7 +120,8 @@ Tarayıcıda genelde `http://localhost:8501` açılır.
 
 | Sorun | Ne yapmalı |
 |-------|------------|
-| `streamlit` tanınmıyor | `Activate.ps1` ile venv açık mı kontrol edin; `pip install -r requirements.txt` tekrar. |
+| `streamlit` tanınmıyor | `Activate.ps1` ile venv açık mı kontrol edin; `python -m pip install -r requirements.txt` tekrar. |
+| `Uygulama Denetimi ilkesi bu dosyayı engelledi` | Windows, venv içindeki `pip.exe` / `streamlit.exe` kısayollarını engelliyor. Komutları `.\.venv\Scripts\python.exe -m pip ...` ve `.\.venv\Scripts\python.exe -m streamlit run main.py` şeklinde çalıştırın. |
 | `429 RESOURCE_EXHAUSTED` | Ücretsiz kota / dakikalık limit; AI Studio’da plan ve limitlere bakın; eşzamanlı istek sayısını düşürün. |
 | API key hatası | `.env` dosyası proje kökünde mi, değişken adı tam `GEMINI_API_KEY` mi; Streamlit’i yeniden başlatın. |
 

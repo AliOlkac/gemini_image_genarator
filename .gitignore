@@ -6,6 +6,9 @@
 # Üretilen görseller - kullanıcıya özgü çıktılar
 outputs/
 
+# Profil formları ve iş kayıtları (yerel durum)
+data/
+
 # Geçici batch JSONL dosyaları (her çalıştırmada yeniden üretiliyor)
 *.jsonl
 
