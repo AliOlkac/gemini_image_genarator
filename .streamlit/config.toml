@@ -1,0 +1,9 @@
+# Proje ayarları: bu klasörden "streamlit run main.py" çalıştırıldığında geçerli.
+# (start.bat da proje klasörüne geçip aynı komutu çalıştırır.)
+
+[server]
+# Streamlit bir bilgisayarda ilk kez çalışınca terminalde "e-posta adresinizi
+# girin" diye soruyor ve cevap gelene kadar uygulamayı AÇMIYOR. Repoyu yeni
+# indiren kişi bunu hata sanıyordu; soruyu kapatıyoruz. Tarayıcı yine
+# otomatik açılır (headless modun aksine).
+showEmailPrompt = false
